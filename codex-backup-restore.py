@@ -1,5 +1,6 @@
-"""Offline transfer of local Codex projects' conversation data (Python 3.14+)."""
+"""Codex Backup & Restore: conversations, sections, global instructions and user skills (Python 3.14+)."""
 import argparse
+import copy
 import hashlib
 import json
 import os
@@ -28,6 +29,8 @@ SIDEBAR = ".codex-global-state.json"
 SESSION_DIRS = {"sessions", "archived_sessions"}
 SECTIONS = "thread_sections"
 SKILL_PREFIX = "user-skills"
+INSTRUCTION_PREFIX = "global-instructions"
+INSTRUCTION_FILES = ("AGENTS.md", "AGENTS.override.md")
 STATE_TABLES = ("projects", "project_roots", "threads", "thread_dynamic_tools",
                 "thread_spawn_edges")
 HISTORY_TABLES = ("thread_turns", "thread_items", "thread_history_projection_state",
@@ -39,6 +42,10 @@ BACKUP_NAME = re.compile(r"conversation-transfer-backup-\d{8}-\d{6}-\d{6}$")
 STATE_TEMP_NAME = re.compile(
     rf"\.\.codex-global-state\.json(?:\.bak)?\.tmp-\d+-{UUID}$", re.I)
 BACKUP_FILES = {STATE, HISTORY, INDEX, SIDEBAR, "new-index.tmp", "new-sidebar.tmp"}
+SECTION_ATOM = "sidebar-custom-sections-v3"
+LEGACY_MAP = "app-server-project-id-by-legacy-project-id-by-host"
+MIGRATION_PREFIX = "electron-owner-value:app-server-projects-migration-by-host:"
+PROJECT_ITEM = "codex:project:"
 
 
 def require_stopped():
@@ -49,8 +56,10 @@ def require_stopped():
          "Get-Process | Select-Object -ExpandProperty ProcessName"],
         check=True, capture_output=True, text=True, errors="replace",
     )
+    ignored = {"codex-windows-sandbox-service", "codex-windows-sandbox-setup"}
     active = {name for name in result.stdout.splitlines()
-              if re.fullmatch(r"(?:codex|chatgpt)(?:[-_ ].*)?", name, re.I)}
+              if name.casefold() not in ignored
+              and re.fullmatch(r"(?:codex|chatgpt)(?:[-_ ].*)?", name, re.I)}
     if active:
         raise ValueError("Fully quit Codex / ChatGPT / Codex CLI first: " + ", ".join(sorted(active)))
 
@@ -260,6 +269,36 @@ def collect_skills(home):
     return skills
 
 
+def collect_instructions(home):
+    files = {}
+    for name in INSTRUCTION_FILES:
+        path = home / name
+        if is_link(path):
+            raise ValueError(f"Global instruction file is a link: {path}")
+        if path.exists():
+            if not path.is_file():
+                raise ValueError(f"Global instruction path is not a file: {path}")
+            files[name] = path
+    return files
+
+
+def plan_instructions(home, work):
+    additions = []
+    for name in INSTRUCTION_FILES:
+        source = work / INSTRUCTION_PREFIX / name
+        if not source.is_file():
+            continue
+        target = home / name
+        if is_link(target) or (target.exists() and not target.is_file()):
+            raise ValueError(f"Unsafe global instruction destination: {target}")
+        if target.is_file():
+            if digest(source) != digest(target):
+                print(f"Global instruction conflict, kept destination: {target}")
+        else:
+            additions.append((source, target))
+    return additions
+
+
 def export(home, archive, preview, include_skills=True):
     if not preview:
         require_stopped()
@@ -272,9 +311,11 @@ def export(home, archive, preview, include_skills=True):
             print(problem)
         if problems:
             raise ValueError(f"{len(problems)} history problems. No bundle created.")
-        if not files:
-            raise ValueError("No local project or section conversations found.")
         skills = collect_skills(home) if include_skills else {}
+        instructions = collect_instructions(home)
+        if not files and not skills and not instructions:
+            raise ValueError("No conversations, user skills or global instruction files found.")
+        print(f"{len(instructions)} global instruction files selected.")
         if include_skills:
             print(f"{len(skills)} user skills selected.")
         if preview:
@@ -321,6 +362,8 @@ def export(home, archive, preview, include_skills=True):
                 for (scope, folder), entries in sorted(skills.items()):
                     for relative, path in sorted(entries.items()):
                         zip_file.write(path, f"{SKILL_PREFIX}/{scope}/{folder}/{relative.as_posix()}")
+                for name, path in instructions.items():
+                    zip_file.write(path, f"{INSTRUCTION_PREFIX}/{name}")
             require_stopped()
             os.rename(package, archive)
         print(f"Saved {archive}")
@@ -340,7 +383,9 @@ def unpack(archive, work, include_skills):
             names.add(name.casefold())
             is_skill = (len(path.parts) >= 4 and path.parts[0] == SKILL_PREFIX
                         and path.parts[1] in {"codex", "agents"} and not path.parts[2].startswith("."))
-            if name not in required and not is_skill and not (
+            is_instruction = (len(path.parts) == 2 and path.parts[0] == INSTRUCTION_PREFIX
+                              and path.parts[1] in INSTRUCTION_FILES)
+            if name not in required and not is_skill and not is_instruction and not (
                     len(path.parts) >= 2 and path.parts[0] in SESSION_DIRS and ROLLOUT.fullmatch(path.name)):
                 raise ValueError(f"Unexpected archive entry: {name}")
             if is_skill and not include_skills:
@@ -556,6 +601,8 @@ def import_bundle(home, archive, preview, provider, include_skills=True):
         skills = plan_skills(home, work) if include_skills else {}
         if include_skills:
             print(f"{len(skills)} new user skills.")
+        instructions = plan_instructions(home, work)
+        print(f"{len(instructions)} new global instruction files.")
         additions = []
         for folder in SESSION_DIRS:
             for path in (work / folder).rglob("*"):
@@ -583,6 +630,7 @@ def import_bundle(home, archive, preview, provider, include_skills=True):
             merge_sidebar(original_sidebar, db, home, projects, memberships)
             db.commit()
         print(f"{len(imported)} new indexed chats, {len(additions)} new rollout files.")
+        additions.extend(instructions)
         print(f"{len(projects)} project registrations, {len(memberships)} chat memberships.")
         with closing(read_db(work / STATE)) as source:
             roots = {Path(path) for path, in source.execute("SELECT path FROM project_roots")}
@@ -763,6 +811,459 @@ def cleanup(home, apply=False):
         print(f"Deleted: {path.name}")
 
 
+def read_state(path):
+    try:
+        if is_link(path) or not path.is_file() or path.stat().st_size > 20 * 1024 * 1024:
+            return None
+        data = json.loads(path.read_text(encoding="utf-8-sig"))
+    except (OSError, UnicodeError, json.JSONDecodeError):
+        return None
+    return data if isinstance(data, dict) else None
+
+
+def state_snapshots(home):
+    if not home.is_dir():
+        return []
+    found = []
+    for path in home.iterdir():
+        if path.name == SIDEBAR or "codex-global-state" not in path.name:
+            continue
+        if read_state(path) is None:
+            continue
+        found.append(path)
+    return sorted(found, key=lambda item: item.stat().st_mtime_ns, reverse=True)
+
+
+def database_projects(db):
+    projects = []
+    for row in db.execute(
+            "SELECT id, name, created_at_ms, updated_at_ms FROM projects ORDER BY position, created_at_ms"):
+        roots = [path for path, in db.execute(
+            "SELECT path FROM project_roots WHERE project_id=? AND IFNULL(path, '') != '' ORDER BY position",
+            (row["id"],))]
+        if not roots:
+            continue
+        projects.append({"id": row["id"], "name": row["name"] or row["id"], "rootPaths": roots,
+                         "createdAt": row["created_at_ms"] or 0, "updatedAt": row["updated_at_ms"] or 0})
+    return projects
+
+
+def database_threads(db):
+    return list(db.execute(
+        "SELECT id, project_id FROM threads WHERE project_id IS NOT NULL AND project_id != ''"))
+
+
+def sidebar_project(project, sidebar_id):
+    return {"id": sidebar_id, "name": project["name"], "rootPaths": list(project["rootPaths"]),
+            "createdAt": project["createdAt"], "updatedAt": project["updatedAt"]}
+
+
+def root_signature(entry):
+    paths = entry.get("rootPaths") if isinstance(entry, dict) else None
+    if not isinstance(paths, list):
+        return ()
+    return tuple(sorted(path_key(path) for path in paths if isinstance(path, str) and path))
+
+
+def legacy_maps(state):
+    raw = state.get(LEGACY_MAP)
+    if not isinstance(raw, dict):
+        return []
+    return [item for item in raw.values() if isinstance(item, dict) and item]
+
+
+def projects_migrated(state, home):
+    home_key = path_key(str(home))
+    for key, value in state.items():
+        if not isinstance(key, str) or not key.startswith(MIGRATION_PREFIX) or not isinstance(value, dict):
+            continue
+        for host, entry in value.items():
+            if (isinstance(host, str) and host.startswith("local:") and isinstance(entry, dict)
+                    and entry.get("projectsMigrated")
+                    and path_key(host.removeprefix("local:")) == home_key):
+                return True
+    return False
+
+
+def registry_scheme(registry, server_ids):
+    if not registry:
+        return "empty"
+    modern = sum(key in server_ids for key in registry)
+    if modern == len(registry):
+        return "server"
+    if modern == 0:
+        return "legacy"
+    return "mixed"
+
+
+def keep_legacy_ids(state, home, scheme):
+    if scheme == "mixed":
+        raise ValueError(
+            "Sidebar project list mixes current database ids and legacy ids. "
+            "Repair stopped so Codex does not import the projects a second time.")
+    if scheme == "legacy":
+        return True
+    if scheme == "server" or projects_migrated(state, home):
+        return False
+    return bool(legacy_maps(state))
+
+
+def unique_legacy(server_id, state):
+    found = []
+    for mapping in legacy_maps(state):
+        for legacy, modern in mapping.items():
+            if modern == server_id and legacy not in found:
+                found.append(legacy)
+    return found[0] if len(found) == 1 else None
+
+
+def unique_root(project, registry):
+    signature = tuple(sorted(path_key(path) for path in project["rootPaths"]))
+    matches = [key for key, entry in registry.items() if root_signature(entry) == signature]
+    return matches[0] if len(matches) == 1 else None
+
+
+def translate_project(source_id, source_state, source_registry, target_registry):
+    if not isinstance(source_id, str) or not source_id:
+        return None
+    if source_id in target_registry:
+        return source_id
+    for mapping in legacy_maps(source_state):
+        modern = mapping.get(source_id)
+        if isinstance(modern, str) and modern in target_registry:
+            return modern
+        for legacy, modern in mapping.items():
+            if modern == source_id and legacy in target_registry:
+                return legacy
+    signature = root_signature(source_registry.get(source_id))
+    if not signature:
+        return None
+    matches = [key for key, entry in target_registry.items() if root_signature(entry) == signature]
+    return matches[0] if len(matches) == 1 else None
+
+
+def section_blobs(state):
+    for key, value in state.items():
+        if not isinstance(key, str) or not key.startswith("electron-owner-atoms:") or not isinstance(value, dict):
+            continue
+        groups = value.get(SECTION_ATOM)
+        if not isinstance(groups, dict):
+            continue
+        for account, blob in groups.items():
+            if isinstance(account, str) and isinstance(blob, dict) and isinstance(blob.get("sections"), list):
+                yield key, account, blob
+
+
+def ordered_section_names(blob):
+    by_id = {section.get("id"): section for section in blob["sections"] if isinstance(section, dict)}
+    names = []
+    for token in blob.get("sectionOrder") or []:
+        if not isinstance(token, str) or not token.startswith("custom:"):
+            continue
+        section = by_id.get(token.removeprefix("custom:"))
+        if isinstance(section, dict) and section.get("name"):
+            names.append(section["name"])
+    if names:
+        return names
+    return [section.get("name") for section in blob["sections"]
+            if isinstance(section, dict) and section.get("name")]
+
+
+def sequence_overlap(left, right):
+    previous = [0] * (len(right) + 1)
+    for item in left:
+        current = [0]
+        for index, other in enumerate(right, 1):
+            current.append(previous[index - 1] + 1 if item == other else max(previous[index], current[-1]))
+        previous = current
+    return previous[-1]
+
+
+def candidate_rank(current_owner, current_account, current_names, owner, account, blob):
+    names = ordered_section_names(blob)
+    overlap = [name for name in names if name in set(current_names)]
+    populated = sum(len(section.get("itemKeys") or [])
+                    for section in blob["sections"] if isinstance(section, dict))
+    if not overlap or populated == 0:
+        return None
+    score = 10 * len(overlap) + sequence_overlap(names, current_names)
+    if owner == current_owner:
+        score += 100
+    if account == current_account:
+        score += 40
+    if names == current_names:
+        score += 30
+    return score
+
+
+def host_ids(section):
+    hosts = section.get("hostSectionIds")
+    if not isinstance(hosts, dict):
+        return set()
+    return {value for value in hosts.values() if isinstance(value, str) and value}
+
+
+def matching_section(current, blob):
+    candidates = [section for section in blob["sections"] if isinstance(section, dict)]
+    current_hosts = host_ids(current)
+    by_host = [section for section in candidates if current_hosts & host_ids(section)]
+    if len(by_host) == 1:
+        return by_host[0]
+    named = [section for section in candidates
+             if section.get("name") == current.get("name") and section.get("itemKeys")]
+    return named[0] if named else None
+
+
+def restored_items(section, source_state, target_registry):
+    source_registry = source_state.get("local-projects")
+    if not isinstance(source_registry, dict):
+        source_registry = {}
+    keys = []
+    skipped = []
+    seen = set()
+    for item in section.get("itemKeys") or []:
+        if not isinstance(item, str) or not item.startswith(PROJECT_ITEM):
+            continue
+        source_id = item.removeprefix(PROJECT_ITEM)
+        target = translate_project(source_id, source_state, source_registry, target_registry)
+        if not target:
+            entry = source_registry.get(source_id)
+            skipped.append(entry.get("name") if isinstance(entry, dict) and entry.get("name") else source_id)
+            continue
+        if target in seen:
+            continue
+        seen.add(target)
+        keys.append(PROJECT_ITEM + target)
+    return keys, skipped
+
+
+def best_section_backup(current_owner, current_account, current_names, snapshots):
+    best = None
+    for index, (label, saved) in enumerate(snapshots):
+        for owner, account, blob in section_blobs(saved):
+            score = candidate_rank(current_owner, current_account, current_names, owner, account, blob)
+            if score is None:
+                continue
+            rank = (score, -index)
+            if best is None or rank > best[0]:
+                best = (rank, label, saved, blob)
+    return None if best is None else best[1:]
+
+
+def canonical_state(data):
+    return json.dumps(data, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+
+
+def plan_repair(state, home, projects, threads, snapshots):
+    if not isinstance(state, dict):
+        raise ValueError("Sidebar state is not an object")
+    planned = copy.deepcopy(state)
+    original = state.get("local-projects")
+    if original is None:
+        original = {}
+    if not isinstance(original, dict):
+        raise ValueError("local-projects is not an object")
+    server_ids = {project["id"] for project in projects}
+    scheme = registry_scheme(original, server_ids)
+    keeping_legacy = keep_legacy_ids(state, home, scheme)
+    registry = planned.get("local-projects")
+    created_registry = registry is None
+    if created_registry:
+        registry = {}
+    elif not isinstance(registry, dict):
+        raise ValueError("local-projects is not an object")
+    lines = [f"Sidebar id scheme: {'legacy' if keeping_legacy else 'current'} "
+             f"({len(projects)} database projects, {len(original)} sidebar projects)."]
+    id_for = {}
+    added = []
+    unmapped = []
+    for project in projects:
+        if keeping_legacy:
+            legacy = unique_legacy(project["id"], state)
+            root_match = unique_root(project, registry)
+            if legacy and root_match and legacy != root_match:
+                unmapped.append(project["name"])
+                continue
+            sidebar_id = legacy or root_match
+            if sidebar_id is None:
+                unmapped.append(project["name"])
+                continue
+        else:
+            sidebar_id = project["id"]
+        id_for[project["id"]] = sidebar_id
+        if sidebar_id not in registry:
+            registry[sidebar_id] = sidebar_project(project, sidebar_id)
+            added.append(project["name"])
+    if created_registry and registry:
+        planned["local-projects"] = registry
+    if not keeping_legacy and legacy_maps(state):
+        planned.pop(LEGACY_MAP, None)
+        lines.append("Remove the legacy project id map so Codex does not import these projects again.")
+    if added:
+        lines.append(f"{len(added)} projects to register:")
+        lines.extend(f"  {name}" for name in added)
+    if unmapped:
+        lines.append("Left unregistered to avoid mixing legacy and current ids:")
+        lines.extend(f"  {name}" for name in unmapped)
+    order = planned.get("project-order")
+    if not isinstance(order, list):
+        order = []
+    seen = {item for item in order if isinstance(item, str)}
+    appended = []
+    for project in projects:
+        sidebar_id = id_for.get(project["id"])
+        if sidebar_id and sidebar_id not in seen:
+            appended.append(sidebar_id)
+            seen.add(sidebar_id)
+    if appended:
+        if not isinstance(planned.get("project-order"), list):
+            planned["project-order"] = []
+        planned["project-order"].extend(appended)
+        lines.append(f"{len(appended)} projects to add to the sidebar order.")
+    pins = planned.get("pinned-project-ids")
+    if not isinstance(pins, list) or not pins:
+        for label, saved in snapshots:
+            raw = saved.get("pinned-project-ids")
+            if not isinstance(raw, list) or not raw:
+                continue
+            source_registry = saved.get("local-projects")
+            if not isinstance(source_registry, dict):
+                source_registry = {}
+            restored = []
+            pin_seen = set()
+            for item in raw:
+                if not isinstance(item, str):
+                    continue
+                sidebar_id = translate_project(item, saved, source_registry, registry)
+                if sidebar_id and sidebar_id not in pin_seen:
+                    restored.append(sidebar_id)
+                    pin_seen.add(sidebar_id)
+            if restored:
+                planned["pinned-project-ids"] = restored
+                names = [registry[key].get("name", key) for key in restored]
+                lines.append(f"{len(restored)} pins from {label}: " + ", ".join(names))
+                break
+    assignments = planned.get("thread-project-assignments")
+    if assignments is None:
+        assignments = {}
+    elif not isinstance(assignments, dict):
+        raise ValueError("thread-project-assignments is not an object")
+    added_threads = []
+    for thread, server_id in threads:
+        if not isinstance(thread, str) or thread in assignments:
+            continue
+        sidebar_id = id_for.get(server_id)
+        if not sidebar_id:
+            continue
+        added_threads.append((thread, sidebar_id))
+    if added_threads:
+        if not isinstance(planned.get("thread-project-assignments"), dict):
+            planned["thread-project-assignments"] = assignments
+        hosts = planned.get("thread-project-membership-host-ids")
+        if not isinstance(hosts, dict):
+            hosts = {}
+            planned["thread-project-membership-host-ids"] = hosts
+        for thread, sidebar_id in added_threads:
+            planned["thread-project-assignments"][thread] = {"projectKind": "local", "projectId": sidebar_id}
+            hosts.setdefault(thread, "local")
+        lines.append(f"{len(added_threads)} chat memberships to restore.")
+    restored_sections = False
+    for owner, account, blob in section_blobs(planned):
+        names = ordered_section_names(blob)
+        backup = best_section_backup(owner, account, names, snapshots)
+        if backup is None:
+            missing = [section.get("name") for section in blob["sections"]
+                       if isinstance(section, dict) and not section.get("itemKeys")]
+            if any(missing):
+                lines.append("No saved section membership for: " + ", ".join(name for name in missing if name))
+            continue
+        label, saved, source_blob = backup
+        for section in blob["sections"]:
+            if not isinstance(section, dict):
+                continue
+            current_items = section.get("itemKeys")
+            if isinstance(current_items, list) and current_items:
+                continue
+            source = matching_section(section, source_blob)
+            if source is None:
+                lines.append(f"Section {section.get('name', section.get('id'))}: no saved membership in {label}.")
+                continue
+            keys, skipped = restored_items(source, saved, registry)
+            if not keys:
+                if skipped:
+                    lines.append(f"Section {section.get('name')}: nothing current remains in {label}.")
+                continue
+            section["itemKeys"] = keys
+            restored_sections = True
+            visible = [registry[key.removeprefix(PROJECT_ITEM)].get("name", key) for key in keys]
+            lines.append(f"Section {section.get('name')} from {label}: " + ", ".join(visible))
+            if skipped:
+                lines.append("  skipped: " + ", ".join(skipped))
+    if restored_sections:
+        placed = set()
+        for _, _, blob in section_blobs(planned):
+            for section in blob["sections"]:
+                if not isinstance(section, dict):
+                    continue
+                for item in section.get("itemKeys") or []:
+                    if isinstance(item, str) and item.startswith(PROJECT_ITEM):
+                        placed.add(item.removeprefix(PROJECT_ITEM))
+        left = [entry.get("name", key) for key, entry in registry.items()
+                if key not in placed and isinstance(entry, dict)]
+        if left:
+            lines.append("Left in Projects: " + ", ".join(left))
+    if canonical_state(planned) == canonical_state(state):
+        lines.append("Nothing to change.")
+        return None, lines
+    return planned, lines
+
+
+def repair(home, apply):
+    require_stopped()
+    sidebar = home / SIDEBAR
+    if not sidebar.is_file():
+        raise ValueError(f"Missing sidebar state: {sidebar}")
+    state = read_state(sidebar)
+    if state is None:
+        raise ValueError(f"Unreadable sidebar state: {sidebar}")
+    with closing(read_db(home / STATE)) as db:
+        projects = database_projects(db)
+        threads = [(row["id"], row["project_id"]) for row in database_threads(db)]
+    snapshots = []
+    for path in state_snapshots(home):
+        saved = read_state(path)
+        if saved is not None:
+            snapshots.append((path.name, saved))
+    print(f"Read {len(snapshots)} sidebar backups.")
+    updated, lines = plan_repair(state, home, projects, threads, snapshots)
+    for line in lines:
+        print(line)
+    if updated is None:
+        return
+    if not apply:
+        print("Preview only. Use repair --apply to write the sidebar state.")
+        return
+    require_stopped()
+    original = sidebar.read_bytes()
+    if read_state(sidebar) != state:
+        raise ValueError("Sidebar state changed while it was being read. Quit Codex and run repair again.")
+    stamp = datetime.now().strftime("%Y%m%d-%H%M%S-%f")
+    backup = home / f"sidebar-repair-backup-{stamp}.json"
+    temp = sidebar.with_name(f".codex-global-state.json.repair-tmp-{stamp}")
+    payload = json.dumps(updated, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+    try:
+        backup.write_bytes(original)
+        temp.write_bytes(payload)
+        require_stopped()
+        if sidebar.read_bytes() != original:
+            raise ValueError("Sidebar state changed. Repair stopped before writing.")
+        os.replace(temp, sidebar)
+    finally:
+        if temp.exists():
+            temp.unlink()
+    print(f"Sidebar repaired. Backup: {backup.name}. Open Codex and check Projects and Sections.")
+
+
 def launch_gui():
     import tkinter as tk
     from tkinter import filedialog, messagebox, ttk
@@ -771,9 +1272,9 @@ def launch_gui():
         def __init__(self, root):
             self.root = root
             self.running = False
-            self.cleanup_preview = None
+            self.preview_ready = None
             self.events = queue.Queue()
-            self.root.title("Codex 项目会话迁移")
+            self.root.title("Codex 备份与恢复")
             self.root.geometry("840x720")
             self.root.minsize(680, 640)
             self.root.configure(background="#f5f7fa")
@@ -803,12 +1304,13 @@ def launch_gui():
             body.grid(sticky="nsew")
             body.columnconfigure(0, weight=1)
             body.rowconfigure(9, weight=1)
-            ttk.Label(body, text="Codex 项目会话迁移", style="Title.TLabel").grid(sticky="w")
-            ttk.Label(body, text="迁移聊天、分页历史、项目分组和 Skills", style="Hint.TLabel").grid(
+            ttk.Label(body, text="Codex 备份与恢复", style="Title.TLabel").grid(sticky="w")
+            ttk.Label(body, text="备份聊天、分组和全局规则，迁移 Skills，修复侧栏", style="Hint.TLabel").grid(
                 sticky="w", pady=(6, 18))
             modes = ttk.Frame(body)
             modes.grid(row=2, sticky="ew", pady=(0, 14))
-            for mode, label in (("export", "导出会话"), ("import", "导入会话"), ("cleanup", "清理旧文件")):
+            for mode, label in (("export", "导出会话"), ("import", "导入会话"),
+                                ("cleanup", "清理旧文件"), ("repair", "修复侧栏")):
                 button = ttk.Radiobutton(modes, text=label, value=mode, variable=self.mode)
                 button.pack(side="left", padx=(0, 28))
                 self.controls.append(button)
@@ -887,25 +1389,27 @@ def launch_gui():
                 self.archive.set(value)
 
         def selection_changed(self, *_):
-            self.cleanup_preview = None
+            self.preview_ready = None
             self.refresh_controls()
 
         def refresh_controls(self):
             for widget in self.controls:
                 widget.configure(state="disabled" if self.running else "normal")
             mode = self.mode.get()
-            cleanup_mode = mode == "cleanup"
-            if cleanup_mode:
+            local_mode = mode in ("cleanup", "repair")
+            if local_mode:
                 for widget in (self.archive_entry, self.archive_button, self.skills_button):
                     widget.configure(state="disabled")
-            labels = {"export": "开始导出", "import": "开始导入", "cleanup": "清理预览中的文件"}
+            labels = {"export": "开始导出", "import": "开始导入",
+                      "cleanup": "清理预览中的文件", "repair": "修复预览中的侧栏"}
             self.run_button.configure(text=labels[mode])
-            if cleanup_mode and self.cleanup_preview != self.home.get():
+            if local_mode and self.preview_ready != (mode, self.home.get()):
                 self.run_button.configure(state="disabled")
             hints = {
-                "export": "自动识别项目和 Section，保存会话及完整分页历史。导出路径应选择一个新 ZIP。",
-                "import": "读取 ZIP，恢复项目分组和聊天。缺失的项目目录会按原路径创建，重复导入会保留已有记录。",
+                "export": "备份项目会话、Section、完整分页历史和全局 AGENTS 规则。导出路径应选择一个新 ZIP。",
+                "import": "从 ZIP 恢复聊天、分组和全局规则。全局规则冲突时保留本机版本，缺失的项目目录会按原路径创建。",
                 "cleanup": "只清理超过 7 天的导入备份和全局状态写入临时文件，保留最新一份导入备份。请先预览。",
+                "repair": "从数据库和旧的侧栏备份恢复被清空的项目、置顶和 Section 成员。不猜测新项目的分组。请先预览。",
             }
             self.hint.configure(text=hints[mode])
 
@@ -919,20 +1423,28 @@ def launch_gui():
             if self.running:
                 return
             mode = self.mode.get()
-            if not self.home.get().strip() or (mode != "cleanup" and not self.archive.get().strip()):
-                messagebox.showerror("路径不完整", "请选择 Codex 数据目录和会话 ZIP。", parent=self.root)
+            if not self.home.get().strip():
+                messagebox.showerror("路径不完整", "请选择 Codex 数据目录。", parent=self.root)
                 return
-            apply = mode == "cleanup" and not preview
+            if mode in ("export", "import") and not self.archive.get().strip():
+                messagebox.showerror("路径不完整", "请选择会话 ZIP。", parent=self.root)
+                return
+            apply = mode in ("cleanup", "repair") and not preview
             if apply:
-                if self.cleanup_preview != self.home.get():
+                if self.preview_ready != (mode, self.home.get()):
                     return
-                if not messagebox.askyesno("确认清理", "将重新检查并永久删除符合条件的旧文件。\n"
-                                          "删除的旧备份将失去对应的回退能力。确认继续？", parent=self.root):
+                prompts = {
+                    "cleanup": ("确认清理", "将重新检查并永久删除符合条件的旧文件。\n"
+                                "删除的旧备份将失去对应的回退能力。确认继续？"),
+                    "repair": ("确认修复", "将按预览写回侧栏状态，并先保存一份备份。\n确认继续？"),
+                }
+                title, question = prompts[mode]
+                if not messagebox.askyesno(title, question, parent=self.root):
                     return
             home = self.home.get()
             command = [sys.executable, "-u", str(Path(__file__).resolve()), mode,
                        "--codex-home", home]
-            if mode != "cleanup":
+            if mode in ("export", "import"):
                 command.insert(4, self.archive.get())
                 if not self.skills.get():
                     command.append("--exclude-skills")
@@ -941,10 +1453,10 @@ def launch_gui():
             elif apply:
                 command.append("--apply")
             self.running = True
-            self.cleanup_preview = None
+            self.preview_ready = None
             self.status.set("正在预览…" if preview else "正在处理…")
             self.write_log("\n" + ("预览" if preview else "执行") +
-                           {"export": "导出", "import": "导入", "cleanup": "清理"}[mode] + "\n")
+                           {"export": "导出", "import": "导入", "cleanup": "清理", "repair": "修复"}[mode] + "\n")
             self.refresh_controls()
             self.progress.start(12)
             threading.Thread(target=self.worker, args=(command, mode, preview, home), daemon=True).start()
@@ -976,8 +1488,8 @@ def launch_gui():
                         self.progress.stop()
                         if code == 0:
                             self.status.set("预览完成" if preview else "操作完成")
-                            if mode == "cleanup" and preview:
-                                self.cleanup_preview = home
+                            if mode in ("cleanup", "repair") and preview:
+                                self.preview_ready = (mode, home)
                         else:
                             self.status.set("操作未完成，请查看运行记录")
                         self.refresh_controls()
@@ -998,7 +1510,7 @@ def launch_gui():
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("mode", choices=("export", "import", "cleanup", "gui"))
+    parser.add_argument("mode", choices=("export", "import", "cleanup", "repair", "gui"))
     parser.add_argument("archive", nargs="?", type=Path,
                         default=Path(__file__).resolve().with_name("codex-chats.zip"),
                         help="ZIP path (default: codex-chats.zip beside this script)")
@@ -1006,7 +1518,7 @@ def main():
         "CODEX_HOME", str(Path.home() / ".codex"))))
     parser.add_argument("--preview", action="store_true")
     parser.add_argument("--apply", action="store_true",
-                        help="Delete the old files listed by cleanup (default: preview only)")
+                        help="Write cleanup deletions or the sidebar repair (default: preview only)")
     skill_options = parser.add_mutually_exclusive_group()
     skill_options.add_argument("--include-skills", dest="include_skills", action="store_true",
                                help="Transfer user skills (default)")
@@ -1018,8 +1530,8 @@ def main():
         launch_gui()
         return
     args = parser.parse_args()
-    if args.apply and args.mode != "cleanup":
-        parser.error("--apply is only valid with cleanup")
+    if args.apply and args.mode not in ("cleanup", "repair"):
+        parser.error("--apply is only valid with cleanup or repair")
     if args.apply and args.preview:
         parser.error("--apply and --preview cannot be combined")
     if args.mode == "gui":
@@ -1030,12 +1542,14 @@ def main():
         export(home, archive, args.preview, args.include_skills)
     elif args.mode == "import":
         import_bundle(home, archive, args.preview, args.provider, args.include_skills)
-    else:
+    elif args.mode == "cleanup":
         cleanup(home, args.apply)
+    else:
+        repair(home, args.apply)
 
 
 if __name__ == "__main__":
     try:
         main()
     except (ValueError, OSError, sqlite3.Error, zipfile.BadZipFile, subprocess.SubprocessError) as exc:
-        sys.exit(f"Transfer stopped: {exc}")
+        sys.exit(f"Stopped: {exc}")
