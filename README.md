@@ -20,13 +20,15 @@
 
 ### 桌面窗口
 
+在资源管理器双击 `Start-Codex-Backup.cmd`。启动文件和 `codex-backup-restore.py` 放在同一个目录。也可以从终端启动：
+
 ```text
 python codex-backup-restore.py
 ```
 
 窗口提供导出、导入、清理、修复四个入口，可选择 Codex 数据目录和 ZIP，并查看运行记录。Skills 默认勾选。修复和清理不使用 ZIP。耗时操作在后台运行，任务结束后可继续操作。
 
-清理和修复都要先点「预览」，核对列表后再执行并确认。正式迁移、修复或清理前请完全退出 Codex。窗口使用 Python 自带的 Tkinter。
+清理和修复都要先点「预览」，核对列表后再执行并确认。如果操作需要退出 Codex，窗口会列出正在运行的相关进程并询问是否结束它们。选「是」会强制结束这些进程并继续，进行中的任务可能中断。选「否」会取消本次操作。窗口使用 Python 自带的 Tkinter。
 
 ### 导出
 
@@ -36,7 +38,7 @@ python codex-backup-restore.py
 python codex-backup-restore.py export
 ```
 
-默认在脚本旁生成 `codex-chats.zip`。脚本会打印识别到的项目、项目根目录、会话及历史段数量。如果发现需要的历史段缺失，导出会停止。默认 ZIP 已存在时，请改用新的文件名。
+默认生成脚本旁的 `backups/codex-chats.zip`。可显式指定其他 ZIP 路径。脚本会打印识别到的项目、项目根目录、会话及历史段数量。如果发现需要的历史段缺失，导出会停止。默认 ZIP 已存在时，请改用新的文件名。
 
 ```text
 python codex-backup-restore.py export codex-chats-new.zip
@@ -52,7 +54,7 @@ python codex-backup-restore.py export codex-chats-new.zip
 python codex-backup-restore.py import
 ```
 
-脚本会备份目标数据库、会话索引和侧栏登记，然后合并会话及项目归属。缺失的项目目录会按旧机的绝对路径创建为空目录。如果路径所在的盘符不可用或没有写权限，导入会停止。迁移保留原工作路径，建议把 Git 仓库放在两台机器相同的绝对路径上。
+脚本会在脚本旁的 `backups/conversation-transfer-backup-时间/` 中保存目标数据库、会话索引和侧栏登记，然后合并会话及项目归属。省略 ZIP 路径时，优先读取 `backups/codex-chats.zip`，也兼容旧版直接放在脚本旁的 ZIP。缺失的项目目录会按旧机的绝对路径创建为空目录。如果路径所在的盘符不可用或没有写权限，导入会停止。迁移保留原工作路径，建议把 Git 仓库放在两台机器相同的绝对路径上。
 
 完成后打开 Codex，检查侧栏项目，打开一条旧会话，确认能翻到前文并继续发送消息。
 
@@ -62,7 +64,13 @@ python codex-backup-restore.py import
 
 同一 Section ID 会复用目标分组。重跑会保留新机已经调整的名称、归属和顺序。旧版生成的 ZIP 仍可导入。要迁移 Section，需要用新版脚本重新导出。
 
-如果新机已经续聊，现有会话和包内历史可能不同。脚本遇到文件内容冲突会停止。保留新机的记录和导入备份。
+重复导入会比较解压后的历史。如果一方的历史是另一方的完整字节前缀，就保留较长的一方。如果两边历史分叉，默认用 ZIP 覆盖目标版本，并同步对应的分页历史和索引。被替换的会话文件保存在本次导入备份的 `rollouts` 子目录。如果目标机独有的会话或分页依赖待覆盖的历史，导入会保留这组历史，并继续导入其余内容。
+
+可先用 `import --preview` 查看待更新和覆盖的文件。分叉时要保留本机版本，在窗口勾选「历史分叉时保留本机版本」，或使用以下命令。普通增量更新仍会执行。
+
+```text
+python codex-backup-restore.py import --keep-existing
+```
 
 ### 全局 AGENTS.md 备份与恢复
 
@@ -70,7 +78,7 @@ python codex-backup-restore.py import
 
 目标机缺少文件时自动恢复，内容相同时跳过，内容不同时提示 `Global instruction conflict, kept destination` 并保留目标机版本。预览会列出待恢复数量及冲突。旧 ZIP 仍可导入；要包含全局规则，请用新版重新导出。项目内的 `AGENTS.md` 随 Git 同步。
 
-发布名称为 **Codex Backup & Restore**，主脚本已改名为 `codex-backup-restore.py`，命令参数和默认 ZIP 名称 `codex-chats.zip` 沿用原用法。全局规则、会话和 Skills 可能包含私人信息，请私下保管备份包。
+发布名称为 **Codex Backup & Restore**，主脚本已改名为 `codex-backup-restore.py`，命令参数沿用原用法。全局规则、会话和 Skills 可能包含私人信息，请私下保管备份包。
 
 ### Skills 迁移
 
@@ -92,7 +100,7 @@ python codex-backup-restore.py cleanup
 python codex-backup-restore.py cleanup --apply
 ```
 
-清理范围为超过 7 天的本脚本导入备份和 Codex 全局状态写入临时文件。最新一份导入备份始终保留。目录或其内部文件最近 7 天有变动时会跳过，含未知文件或链接的备份目录也会跳过。删除的旧备份会失去对应的回退能力。
+清理范围包括脚本旁 `backups` 和 Codex 数据目录中超过 7 天的导入备份，以及过期的 Codex 全局状态写入临时文件。每个位置最新一份导入备份会保留。含被覆盖会话文件的备份也会保留。目录或其内部文件最近 7 天有变动时会跳过，含未知文件或链接的备份目录也会跳过。删除的旧备份会失去对应的回退能力。
 
 会话、正式数据库、Skills、配置、浏览器数据、导出的 ZIP 和其他工具的备份会保留。`cleanup` 默认只打印路径和可释放大小，`--apply` 才会永久删除列出的项。
 
@@ -105,7 +113,7 @@ python codex-backup-restore.py repair
 python codex-backup-restore.py repair --apply
 ```
 
-先预览。核对输出后，完全退出 Codex，再加 `--apply`。脚本会把当前 `.codex-global-state.json` 备份为 `sidebar-repair-backup-时间.json`，然后写回侧栏。窗口里的「修复侧栏」也要先预览，再确认后写入。
+先预览。核对输出后，完全退出 Codex，再加 `--apply`。脚本会把当前 `.codex-global-state.json` 备份到脚本旁的 `backups/sidebar-repair-backup-时间.json`，然后写回侧栏。窗口里的「修复侧栏」也要先预览，再确认后写入。
 
 项目登记使用数据库里的当前项目 id。侧栏如果还保存着迁移前的旧 id，脚本保持这些旧 id，不把它们改成当前 id。当前 id 和旧 id 映射同时存在时，脚本会去掉这份旧映射，避免 Codex 下次启动时把同一项目再导入一次。
 
@@ -118,7 +126,7 @@ Section 成员只从本机已有的全局状态备份中填回当前分组，分
 ```text
 python codex-backup-restore.py --help
 python codex-backup-restore.py export --preview
-python codex-backup-restore.py import codex-chats.zip --preview
+python codex-backup-restore.py import --preview
 ```
 
 导入预览会读取 ZIP 并检查目标状态，列出将创建的目录。正式导入时才写入项目目录和 Codex 数据。使用自定义 Codex 数据目录时，可以传入 `--codex-home`。
@@ -137,13 +145,15 @@ The commands below work in PowerShell and Git Bash. Use `py -3.14` if `python` p
 
 ### Desktop window
 
+Double-click `Start-Codex-Backup.cmd` in File Explorer. Keep it beside `codex-backup-restore.py`. You can also start it from a terminal:
+
 ```text
 python codex-backup-restore.py
 ```
 
 The Chinese-language desktop window provides export, import, cleanup, and repair controls, directory and ZIP pickers, a Skills checkbox enabled by default, and a live activity log. Repair and cleanup do not use a ZIP. Operations run in the background while the controls are locked.
 
-For cleanup or repair, preview first, then run the action and confirm. Fully quit Codex before transferring, repairing, or deleting files. The window uses Python's bundled Tkinter.
+For cleanup or repair, preview first, then run the action and confirm. If the operation requires Codex to exit, the window lists the running processes and asks whether to close them. Choose Yes to force them to exit and continue, which may interrupt ongoing tasks. Choose No to cancel. The window uses Python's bundled Tkinter.
 
 ### Export
 
@@ -153,7 +163,7 @@ On the source computer, open a terminal in the script directory and run:
 python codex-backup-restore.py export
 ```
 
-The default archive is `codex-chats.zip` beside the script. Pass a different ZIP filename if the default already exists. Export stops if it detects missing history required by a selected conversation.
+The default archive is `backups/codex-chats.zip` under the script directory. Pass a different ZIP filename if the default already exists. Export stops if it detects missing history required by a selected conversation.
 
 ### Import
 
@@ -163,11 +173,17 @@ Copy the script and ZIP to the destination computer. Sign in to Codex with the d
 python codex-backup-restore.py import
 ```
 
-The script reads the ZIP directly, backs up destination databases and indexes, and merges conversations and project assignments. It creates empty directories for missing project roots at their original absolute paths. Put your Git repositories at the same paths to keep the restored chats' working directories usable. Open Codex afterward and verify that an old conversation shows its earlier messages and accepts a new one.
+The script reads the ZIP directly, saves destination databases, indexes, and sidebar state under `backups/conversation-transfer-backup-<timestamp>/` beside the script, and merges conversations and project assignments. With no ZIP argument, import looks under `backups` first, then beside the script for an older archive. It creates empty directories for missing project roots at their original absolute paths. Put your Git repositories at the same paths to keep the restored chats' working directories usable. Open Codex afterward and verify that an old conversation shows its earlier messages and accepts a new one.
 
 ### Repeat an import
 
-Run the same import command with the original ZIP to fill in project registrations and chat assignments, including after an earlier version imported the conversations. Identical conversation files and existing history index entries are reused. `0 new indexed chats` is expected if all conversations are already present. Check the `project registrations` and `chat memberships` counts. If the destination conversation has diverged, the script stops on the conflict.
+On repeat import, the script compares decompressed history. If one history is an exact byte prefix of the other, it keeps the longer version. Divergent histories default to the ZIP version. The importer updates the associated paginated history and index and saves replaced conversation files under `rollouts` in the import backup. If destination-only history depends on a file that would be overwritten, the importer keeps that group and continues with the remaining data.
+
+Use `import --preview` to see proposed updates and replacements. To keep the destination version when history diverges, select the corresponding checkbox in the window or run the command below. Ordinary incremental updates still apply.
+
+```text
+python codex-backup-restore.py import --keep-existing
+```
 
 Repeat imports reuse Sections by ID and preserve destination names, assignments, and chat order. Older ZIPs still import. To transfer Sections, export a new ZIP with the updated script.
 
@@ -177,7 +193,7 @@ Export includes `AGENTS.md` and `AGENTS.override.md` from the Codex data directo
 
 Missing destination files are restored. Identical files are skipped. When contents differ, the importer reports `Global instruction conflict, kept destination` and keeps the destination version. Preview reports additions and conflicts. Older ZIPs remain supported; export a fresh ZIP with this version to include global instructions. Repository-level `AGENTS.md` files travel through Git.
 
-The project is named **Codex Backup & Restore** and the main script is now `codex-backup-restore.py`. Existing command arguments and the default ZIP name `codex-chats.zip` are retained. Global instructions, conversations, and Skills may contain private information; keep backup packages private.
+The project is named **Codex Backup & Restore** and the main script is now `codex-backup-restore.py`. Existing command arguments still work. Global instructions, conversations, and Skills may contain private information; keep backup packages private.
 
 ### Skill transfer
 
@@ -199,7 +215,7 @@ python codex-backup-restore.py cleanup
 python codex-backup-restore.py cleanup --apply
 ```
 
-Cleanup selects this script's import backups and Codex global-state write temporary files older than seven days. The newest import backup is always kept. Recently modified directories or files, backups with unexpected contents, and links are skipped. Deleting an old backup removes its corresponding rollback option.
+Cleanup checks the script's `backups` directory and the Codex data directory for import backups older than seven days. It also checks for old Codex global-state temporary files. It keeps the newest import backup in each location and backups of replaced conversation files. Recently modified directories or files, backups with unexpected contents, and links are skipped. Deleting an old backup removes its corresponding rollback option.
 
 Conversations, active databases, Skills, configuration, browser data, exported ZIPs, and other tools' backups are retained. The default command lists candidates and their size. `--apply` permanently deletes the listed candidates.
 
@@ -212,7 +228,7 @@ python codex-backup-restore.py repair
 python codex-backup-restore.py repair --apply
 ```
 
-Preview first. After checking the output, quit Codex completely and run the command with `--apply`. The script copies `.codex-global-state.json` to `sidebar-repair-backup-<timestamp>.json`, then writes the sidebar. In the desktop window, choose 修复侧栏, preview, and confirm before it writes.
+Preview first. After checking the output, quit Codex completely and run the command with `--apply`. The script copies `.codex-global-state.json` to `backups/sidebar-repair-backup-<timestamp>.json` beside the script, then writes the sidebar. In the desktop window, choose 修复侧栏, preview, and confirm before it writes.
 
 Project records use the ids currently stored in the database. When the sidebar still stores pre-migration ids, the script keeps those ids. When current ids and the legacy id map are both present, the script removes that map so Codex does not import the same projects again on the next launch.
 
@@ -225,7 +241,7 @@ Section membership is copied only from a global-state backup already on this com
 ```text
 python codex-backup-restore.py --help
 python codex-backup-restore.py export --preview
-python codex-backup-restore.py import codex-chats.zip --preview
+python codex-backup-restore.py import --preview
 ```
 
 Use `--codex-home` to select a custom Codex data directory. Import preview checks the package and destination and lists missing project directories before applying changes.

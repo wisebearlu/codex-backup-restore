@@ -26,6 +26,10 @@ STATE = "state_5.sqlite"
 HISTORY = "thread_history_1.sqlite"
 INDEX = "session_index.jsonl"
 SIDEBAR = ".codex-global-state.json"
+SCRIPT_DIR = Path(__file__).resolve().parent
+BACKUP_DIR = SCRIPT_DIR / "backups"
+DEFAULT_ARCHIVE = BACKUP_DIR / "codex-chats.zip"
+LEGACY_ARCHIVE = SCRIPT_DIR / DEFAULT_ARCHIVE.name
 SESSION_DIRS = {"sessions", "archived_sessions"}
 SECTIONS = "thread_sections"
 SKILL_PREFIX = "user-skills"
@@ -48,20 +52,47 @@ MIGRATION_PREFIX = "electron-owner-value:app-server-projects-migration-by-host:"
 PROJECT_ITEM = "codex:project:"
 
 
-def require_stopped():
+def active_codex_processes():
     if os.name != "nt":
         raise ValueError("This release supports Windows on both computers.")
     result = subprocess.run(
         ["powershell.exe", "-NoProfile", "-NonInteractive", "-Command",
-         "Get-Process | Select-Object -ExpandProperty ProcessName"],
-        check=True, capture_output=True, text=True, errors="replace",
+         "Get-Process | ForEach-Object { '{0}:{1}' -f $_.Id, $_.ProcessName }"],
+        check=True, capture_output=True, text=True, errors="replace", timeout=15,
+        creationflags=subprocess.CREATE_NO_WINDOW,
     )
     ignored = {"codex-windows-sandbox-service", "codex-windows-sandbox-setup"}
-    active = {name for name in result.stdout.splitlines()
-              if name.casefold() not in ignored
-              and re.fullmatch(r"(?:codex|chatgpt)(?:[-_ ].*)?", name, re.I)}
+    active = {}
+    for line in result.stdout.splitlines():
+        pid, separator, name = line.partition(":")
+        if separator and pid.isascii() and pid.isdecimal() and name.casefold() not in ignored \
+                and re.fullmatch(r"(?:codex|chatgpt)(?:[-_ ][a-z0-9_ .-]+)?", name, re.I):
+            active[int(pid)] = name
+    return active
+
+
+def require_stopped():
+    active = active_codex_processes()
     if active:
-        raise ValueError("Fully quit Codex / ChatGPT / Codex CLI first: " + ", ".join(sorted(active)))
+        raise ValueError("Fully quit Codex / ChatGPT / Codex CLI first: " + ", ".join(sorted(set(active.values()))))
+
+
+def close_codex_processes(approved):
+    for pid, name in approved.items():
+        subprocess.run(
+            ["powershell.exe", "-NoProfile", "-NonInteractive", "-Command",
+             f"$p = Get-Process -Id {pid} -ErrorAction SilentlyContinue; "
+             f"if ($p -and $p.ProcessName -eq '{name}' -and "
+             "$p.SessionId -eq (Get-Process -Id $PID).SessionId) "
+             "{ Stop-Process -InputObject $p -Force -ErrorAction Stop }"],
+            check=True, capture_output=True, text=True, errors="replace", timeout=15,
+            creationflags=subprocess.CREATE_NO_WINDOW,
+        )
+    deadline = time.monotonic() + 6
+    while active_codex_processes():
+        if time.monotonic() >= deadline:
+            raise ValueError("Codex processes are still running. Close the remaining apps and retry.")
+        time.sleep(0.2)
 
 
 def read_db(path):
@@ -236,6 +267,18 @@ def is_link(path):
     return path.is_symlink() or path.is_junction()
 
 
+def ensure_backup_directory():
+    if is_link(BACKUP_DIR):
+        raise ValueError(f"Backup directory is a link: {BACKUP_DIR}")
+    BACKUP_DIR.mkdir(exist_ok=True)
+
+
+def default_archive(mode):
+    if mode == "import" and not DEFAULT_ARCHIVE.exists() and LEGACY_ARCHIVE.is_file():
+        return LEGACY_ARCHIVE
+    return DEFAULT_ARCHIVE
+
+
 def raise_walk_error(error):
     raise error
 
@@ -324,6 +367,8 @@ def export(home, archive, preview, include_skills=True):
             raise ValueError(f"Output already exists: {archive}")
         if archive.is_relative_to(home):
             raise ValueError("Save the archive outside CODEX_HOME.")
+        if archive.parent == BACKUP_DIR:
+            ensure_backup_directory()
         with tempfile.TemporaryDirectory(dir=archive.parent) as work:
             work = Path(work)
             state_filter = {"projects": "id IN (SELECT id FROM picked_projects)",
@@ -405,6 +450,138 @@ def digest(path):
         return hashlib.file_digest(stream, "sha256").digest()
 
 
+def compare_rollouts(source, target):
+    """Compare decoded bytes so compression settings do not affect the decision."""
+    source_open = zstd.open if source.name.endswith(".zst") else open
+    target_open = zstd.open if target.name.endswith(".zst") else open
+    with source_open(source, "rb") as left, target_open(target, "rb") as right:
+        while True:
+            incoming = left.read(1024 * 1024)
+            current = right.read(1024 * 1024)
+            if incoming == current:
+                if not incoming:
+                    return "same"
+                continue
+            if len(incoming) > len(current) and incoming.startswith(current):
+                return "update"
+            if len(current) > len(incoming) and current.startswith(incoming):
+                return "ahead"
+            return "diverged"
+
+
+def rollout_ids(path):
+    match = ROLLOUT.fullmatch(path.name)
+    if match is None:
+        raise ValueError(f"Invalid rollout filename: {path.name}")
+    meta = header(path)
+    ids = set(filter(None, (*match.groups(), meta["id"])))
+    related = set(filter(None, (meta.get("forked_from_id"),
+                                (meta.get("history_base") or {}).get("thread_id"))))
+    return ids, related
+
+
+def related_ids(seeds, edges):
+    found = set(seeds)
+    pending = deque(found)
+    while pending:
+        for key in edges[pending.popleft()] - found:
+            found.add(key)
+            pending.append(key)
+    return found
+
+
+def plan_rollouts(work, home, target_db, keep_existing):
+    primary = defaultdict(set)
+    destinations = {}
+    edges = defaultdict(set)
+    with closing(read_db(work / STATE)) as source:
+        for key, relative in source.execute("SELECT id, rollout_path FROM threads"):
+            relative = PurePosixPath(relative)
+            path = work / relative
+            if (len(relative.parts) < 2 or relative.parts[0] not in SESSION_DIRS
+                    or ".." in relative.parts or not ROLLOUT.fullmatch(relative.name)
+                    or not path.resolve().is_relative_to(work) or not path.is_file()):
+                raise ValueError(f"Invalid primary rollout for {key}")
+            primary[path].add(key)
+            current = target_db.execute("SELECT rollout_path FROM threads WHERE id=?", (key,)).fetchone()
+            if current:
+                destinations[path] = Path(current[0])
+        for parent, child in source.execute("SELECT parent_thread_id, child_thread_id FROM thread_spawn_edges"):
+            edges[parent].add(child)
+            edges[child].add(parent)
+    plans = []
+    ahead = set()
+    diverged = set()
+    targets = set()
+    for folder in sorted(SESSION_DIRS):
+        for path in sorted((work / folder).rglob("*")):
+            if not path.is_file():
+                continue
+            ids, related = rollout_ids(path)
+            ids.update(primary[path])
+            for key in ids | related:
+                edges[key].update((ids | related) - {key})
+            bundled_target = home / path.relative_to(work)
+            target = destinations.get(path, bundled_target)
+            if (not target.is_absolute() or not ROLLOUT.fullmatch(target.name) or is_link(target)
+                    or not any(target.resolve().is_relative_to(home / directory)
+                               for directory in SESSION_DIRS)):
+                raise ValueError(f"Unsafe rollout destination: {target}")
+            if target != bundled_target and bundled_target.exists():
+                raise ValueError(f"Multiple destination copies for rollout: {path.name}")
+            if target in targets:
+                raise ValueError(f"Multiple archived rollouts point to: {target}")
+            targets.add(target)
+            if target.exists() and not target.is_file():
+                raise ValueError(f"Rollout destination is not a file: {target}")
+            status = compare_rollouts(path, target) if target.is_file() else "new"
+            if status == "ahead":
+                ahead.update(ids)
+            elif status == "diverged":
+                diverged.update(ids)
+            plans.append((path, target, ids, status))
+
+    divergent_group = related_ids(diverged, edges)
+    skipped = related_ids(ahead - divergent_group, edges)
+    for _, target, ids, status in plans:
+        if status in {"ahead", "diverged"}:
+            print(f"Rollout {status}: {target.name}")
+    if keep_existing:
+        skipped.update(divergent_group)
+    elif divergent_group:
+        # A destination-only fork or page may refer to bytes replaced by this import.
+        changed_ids = {key for _, _, ids, status in plans
+                       if status in {"ahead", "diverged"} and ids & divergent_group for key in ids}
+        for folder in SESSION_DIRS:
+            for path in (home / folder).rglob("rollout-*.jsonl*"):
+                if path in targets or not path.is_file() or not ROLLOUT.fullmatch(path.name):
+                    continue
+                ids, related = rollout_ids(path)
+                affected = (ids | related) & changed_ids
+                if affected:
+                    skipped.update(related_ids(affected, edges))
+                    print(f"Keeping history referenced by destination-only rollout: {path.name}")
+    if skipped:
+        print(f"Keeping destination history for {len(skipped)} related history IDs.")
+    additions = []
+    replacements = []
+    refreshed = set()
+    locations = {}
+    for path, target, ids, status in plans:
+        if ids & skipped:
+            continue
+        locations[path.relative_to(work).as_posix()] = target
+        if status == "new":
+            additions.append((path, target))
+        elif status != "same":
+            if target.name.endswith(".zst") != path.name.endswith(".zst"):
+                raise ValueError(f"Different rollout encodings for {target.name}; retry with --keep-existing "
+                                 "for divergent history.")
+            replacements.append((path, target, digest(target)))
+            refreshed.update(ids)
+    return additions, replacements, skipped, refreshed, locations
+
+
 def plan_skills(home, work):
     planned = {}
     for scope, root in skill_roots(home).items():
@@ -457,7 +634,7 @@ def merge_sections(db, source):
     return created
 
 
-def import_rows(db, work, home, provider):
+def import_rows(db, work, provider, skipped, refreshed, locations):
     with closing(read_db(work / STATE)) as source, closing(read_db(work / HISTORY)) as history:
         for input_db, schema, tables in ((source, "main", STATE_TABLES),
                                          (history, "hist", HISTORY_TABLES)):
@@ -491,20 +668,19 @@ def import_rows(db, work, home, provider):
             for root in roots[key]:
                 merge_row(db, "main", "project_roots", root)
         new_sections = merge_sections(db, source)
-        existing = {r[0]: (r[1], r[2]) for r in db.execute("SELECT id, rollout_path, project_id FROM threads")}
+        existing = dict(db.execute("SELECT id, project_id FROM threads"))
         imported = set()
         memberships = {}
         for item in source.execute("SELECT * FROM threads"):
             row = dict(item)
             key = row["id"]
+            if key in skipped:
+                continue
             relative = PurePosixPath(row["rollout_path"])
             if relative.parts[0] not in SESSION_DIRS or not (work / relative).is_file():
                 raise ValueError(f"Invalid primary rollout for {key}")
             if key in existing:
-                old_path, current_project = existing[key]
-                old = Path(old_path)
-                if not old.is_file() or digest(old) != digest(work / relative):
-                    raise ValueError(f"Target has a different history for {key}; no changes applied.")
+                current_project = existing[key]
                 project = current_project or project_map.get(row["project_id"])
                 if project:
                     memberships[key] = project
@@ -515,8 +691,19 @@ def import_rows(db, work, home, provider):
                                "section_entered_at_ms=? WHERE id=? AND thread_section_id IS NULL",
                                (row["thread_section_id"], row["section_position"],
                                 row["section_entered_at_ms"], key))
+                if key in refreshed:
+                    # Keep local placement and account fields while refreshing history metadata.
+                    local_fields = {"id", "project_id", "thread_section_id", "section_position",
+                                    "section_entered_at_ms", "creator_account_id", "creator_user_id",
+                                    "pinned_at", "is_pinned"}
+                    updates = {column: value for column, value in row.items() if column not in local_fields}
+                    updates["rollout_path"] = str(locations[relative.as_posix()])
+                    if provider and "model_provider" in updates:
+                        updates["model_provider"] = provider
+                    fields = ", ".join(f"{quote(column)}=?" for column in updates)
+                    db.execute(f"UPDATE threads SET {fields} WHERE id=?", (*updates.values(), key))
                 continue
-            row["rollout_path"] = str(home / relative)
+            row["rollout_path"] = str(locations[relative.as_posix()])
             row["project_id"] = project_map.get(row["project_id"])
             if row["project_id"]:
                 memberships[key] = row["project_id"]
@@ -525,12 +712,16 @@ def import_rows(db, work, home, provider):
             merge_row(db, "main", "threads", row)
             imported.add(key)
         for table in STATE_TABLES[3:]:
+            id_column = "thread_id" if table == "thread_dynamic_tools" else "child_thread_id"
+            db.executemany(f"DELETE FROM main.{quote(table)} WHERE {id_column}=?",
+                           ((key,) for key in refreshed))
             for item in source.execute(f"SELECT * FROM {quote(table)}"):
                 row = dict(item)
-                key = row.get("thread_id", row.get("child_thread_id"))
-                if key in imported:
+                if row[id_column] in imported or row[id_column] in refreshed:
                     merge_row(db, "main", table, row)
         for table in HISTORY_TABLES:
+            db.executemany(f"DELETE FROM hist.{quote(table)} WHERE thread_id=?",
+                           ((key,) for key in refreshed))
             primary_key = [column[1] for column in sorted(
                 db.execute(f"PRAGMA hist.table_info({quote(table)})"), key=lambda column: column[5])
                 if column[5]]
@@ -539,7 +730,8 @@ def import_rows(db, work, home, provider):
             match = " AND ".join(f"{quote(column)}=?" for column in primary_key)
             for item in history.execute(f"SELECT * FROM {quote(table)}"):
                 row = dict(item)
-                if row["thread_id"] in existing:
+                key = row["thread_id"]
+                if key in skipped or (key in existing and key not in refreshed):
                     continue
                 # A paginated segment can have projection rows without a threads row.
                 # Preserve its existing projection when reimporting the same bundle.
@@ -593,7 +785,25 @@ def merge_sidebar(original, db, home, project_ids, memberships):
     return json.dumps(state, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
 
 
-def import_bundle(home, archive, preview, provider, include_skills=True):
+def replace_file(target, *, content=None, source=None):
+    # Stage beside the target so replacement also works across different drives.
+    with tempfile.NamedTemporaryFile(dir=target.parent, prefix=".codex-transfer-",
+                                     suffix=".tmp", delete=False) as staged:
+        path = Path(staged.name)
+        try:
+            if source is None:
+                staged.write(content)
+            else:
+                with source.open("rb") as incoming:
+                    shutil.copyfileobj(incoming, staged)
+            staged.close()
+            os.replace(path, target)
+        finally:
+            staged.close()
+            path.unlink(missing_ok=True)
+
+
+def import_bundle(home, archive, preview, provider, include_skills=True, keep_existing=False):
     require_stopped()
     with tempfile.TemporaryDirectory(prefix="codex-transfer-", dir=archive.parent) as temp:
         work = Path(temp)
@@ -603,19 +813,6 @@ def import_bundle(home, archive, preview, provider, include_skills=True):
             print(f"{len(skills)} new user skills.")
         instructions = plan_instructions(home, work)
         print(f"{len(instructions)} new global instruction files.")
-        additions = []
-        for folder in SESSION_DIRS:
-            for path in (work / folder).rglob("*"):
-                if not path.is_file():
-                    continue
-                target = home / path.relative_to(work)
-                if not target.resolve().is_relative_to(home):
-                    raise ValueError(f"Unsafe destination: {target}")
-                if target.exists():
-                    if not target.is_file() or digest(path) != digest(target):
-                        raise ValueError(f"Different rollout already exists: {target.name}")
-                else:
-                    additions.append((path, target))
         original_index = (home / INDEX).read_bytes() if (home / INDEX).is_file() else None
         original_sidebar = (home / SIDEBAR).read_bytes() if (home / SIDEBAR).is_file() else None
         # Work on database snapshots, leaving the live profile untouched during preview.
@@ -626,10 +823,14 @@ def import_bundle(home, archive, preview, provider, include_skills=True):
             db.execute("PRAGMA foreign_keys=ON")
             db.execute("ATTACH DATABASE ? AS hist", (str(work / ("target-" + HISTORY)),))
             db.execute("BEGIN")
-            imported, existing, projects, memberships = import_rows(db, work, home, provider)
+            additions, replacements, skipped, refreshed, locations = plan_rollouts(work, home, db, keep_existing)
+            imported, existing, projects, memberships = import_rows(db, work, provider, skipped, refreshed, locations)
             merge_sidebar(original_sidebar, db, home, projects, memberships)
             db.commit()
         print(f"{len(imported)} new indexed chats, {len(additions)} new rollout files.")
+        print(f"{len(replacements)} rollout files to update or overwrite.")
+        for _, target, _ in replacements:
+            print(f"  {target.name}")
         additions.extend(instructions)
         print(f"{len(projects)} project registrations, {len(memberships)} chat memberships.")
         with closing(read_db(work / STATE)) as source:
@@ -647,7 +848,8 @@ def import_bundle(home, archive, preview, provider, include_skills=True):
         if preview:
             return
         require_stopped()
-        backup = home / ("conversation-transfer-backup-" + datetime.now().strftime("%Y%m%d-%H%M%S-%f"))
+        ensure_backup_directory()
+        backup = BACKUP_DIR / ("conversation-transfer-backup-" + datetime.now().strftime("%Y%m%d-%H%M%S-%f"))
         backup.mkdir()
         for name in (STATE, HISTORY):
             snapshot(home / name, backup / name)
@@ -655,15 +857,23 @@ def import_bundle(home, archive, preview, provider, include_skills=True):
             (backup / INDEX).write_bytes(original_index)
         if original_sidebar is not None:
             (backup / SIDEBAR).write_bytes(original_sidebar)
-        previous = set(row.get("id") for row in index_lines(home / INDEX))
-        new_rows = [row for row in index_lines(work / INDEX)
-                    if row.get("id") not in previous and row.get("id") not in existing]
+        previous = list(index_lines(home / INDEX))
+        indexed_ids = {row.get("id") for row in previous}
+        replacement_rows = {}
+        new_rows = []
+        for row in index_lines(work / INDEX):
+            key = row.get("id")
+            if key in refreshed:
+                replacement_rows[key] = row
+            elif key not in indexed_ids and key not in existing and key not in skipped:
+                new_rows.append(row)
+        updated = [replacement_rows.get(row.get("id"), row) for row in previous]
+        updated.extend(row for key, row in replacement_rows.items() if key not in indexed_ids)
         created = []
         created_dirs = []
+        replaced = []
         index_changed = False
         sidebar_changed = False
-        index_temp = backup / "new-index.tmp"
-        sidebar_temp = backup / "new-sidebar.tmp"
         try:
             for root in missing_roots:
                 for directory in (*reversed(root.parents), root):
@@ -696,13 +906,6 @@ def import_bundle(home, archive, preview, provider, include_skills=True):
                     created.append(target)
                     with source.open("rb") as incoming:
                         shutil.copyfileobj(incoming, output)
-            if new_rows:
-                prefix = original_index or b""
-                if prefix and not prefix.endswith(b"\n"):
-                    prefix += b"\n"
-                index_temp.write_bytes(prefix + "".join(json.dumps(r) + "\n" for r in new_rows).encode())
-                os.replace(index_temp, home / INDEX)
-                index_changed = True
             require_stopped()
             with closing(sqlite3.connect(home / STATE)) as db:
                 db.row_factory = sqlite3.Row
@@ -712,27 +915,40 @@ def import_bundle(home, archive, preview, provider, include_skills=True):
                     if db.execute(f"PRAGMA {schema}.journal_mode=DELETE").fetchone()[0] != "delete":
                         raise ValueError("Could not obtain exclusive access to the target databases.")
                 db.execute("BEGIN EXCLUSIVE")
-                _, _, projects, memberships = import_rows(db, work, home, provider)
+                _, _, projects, memberships = import_rows(db, work, provider, skipped, refreshed, locations)
+                for source, target, expected in replacements:
+                    if is_link(target) or not target.resolve().is_relative_to(home) or digest(target) != expected:
+                        raise ValueError(f"Destination rollout changed during import: {target}")
+                    saved = backup / "rollouts" / target.relative_to(home)
+                    saved.parent.mkdir(parents=True, exist_ok=True)
+                    shutil.copy2(target, saved)
+                    if digest(saved) != expected:
+                        raise ValueError(f"Destination rollout changed during backup: {target}")
+                    replace_file(target, source=source)
+                    replaced.append((saved, target))
+                if new_rows or replacement_rows:
+                    replace_file(home / INDEX, content="".join(
+                        json.dumps(row) + "\n" for row in updated + new_rows).encode())
+                    index_changed = True
                 sidebar = merge_sidebar(original_sidebar, db, home, projects, memberships)
-                sidebar_temp.write_bytes(sidebar)
-                os.replace(sidebar_temp, home / SIDEBAR)
+                replace_file(home / SIDEBAR, content=sidebar)
                 sidebar_changed = True
                 db.commit()
         except Exception:
+            for saved, target in reversed(replaced):
+                replace_file(target, source=saved)
             if sidebar_changed:
                 if original_sidebar is None:
                     (home / SIDEBAR).unlink()
                 else:
-                    sidebar_temp.write_bytes(original_sidebar)
-                    os.replace(sidebar_temp, home / SIDEBAR)
+                    replace_file(home / SIDEBAR, content=original_sidebar)
             for path in reversed(created):
                 path.unlink()
             if index_changed:
                 if original_index is None:
                     (home / INDEX).unlink()
                 else:
-                    index_temp.write_bytes(original_index)
-                    os.replace(index_temp, home / INDEX)
+                    replace_file(home / INDEX, content=original_index)
             for directory in reversed(created_dirs):
                 try:
                     directory.rmdir()
@@ -764,14 +980,20 @@ def cleanup(home, apply=False):
     if not home.is_dir():
         raise ValueError(f"Missing Codex directory: {home}")
     cutoff = time.time_ns() - CLEANUP_DAYS * 24 * 60 * 60 * 1_000_000_000
-    children = list(home.iterdir())
-    backups = sorted((path for path in children if BACKUP_NAME.fullmatch(path.name)),
-                     key=lambda path: path.name, reverse=True)
-    protected = backups[0] if backups else None
+    roots = {home, BACKUP_DIR}
+    children = set(home.iterdir())
+    protected = set()
+    if BACKUP_DIR.is_dir() and not is_link(BACKUP_DIR):
+        children.update(path for path in BACKUP_DIR.iterdir() if BACKUP_NAME.fullmatch(path.name))
+    for root in roots:
+        backups = [path for path in children if path.parent == root and BACKUP_NAME.fullmatch(path.name)
+                   and path.is_dir() and not is_link(path)]
+        if backups:
+            protected.add(max(backups))
     candidates = []
     total_bytes = 0
     for path in sorted(children):
-        if path == protected:
+        if path in protected:
             continue
         is_backup = bool(BACKUP_NAME.fullmatch(path.name))
         if not is_backup and not STATE_TEMP_NAME.fullmatch(path.name):
@@ -790,16 +1012,17 @@ def cleanup(home, apply=False):
         size = sum(info[1] for entry, info in snapshot.items() if entry.is_file())
         total_bytes += size
         candidates.append((path, snapshot))
-        print(f"Cleanup candidate: {path.name} ({size:,} bytes)")
+        print(f"Cleanup candidate: {path} ({size:,} bytes)")
     print(f"{len(candidates)} cleanup candidates, {total_bytes:,} bytes.")
-    if protected:
-        print(f"Keeping newest import backup: {protected.name}")
+    for path in sorted(protected):
+        print(f"Keeping newest import backup: {path}")
     if not apply:
         print("Preview only. Use cleanup --apply to delete these old files.")
         return
     require_stopped()
     for path, snapshot in candidates:
-        if not path.resolve().is_relative_to(home.resolve()) or cleanup_snapshot(path) != snapshot:
+        if path.parent not in roots or is_link(path.parent) or path.resolve().parent != path.parent.resolve() \
+                or cleanup_snapshot(path) != snapshot:
             raise ValueError(f"Cleanup candidate changed; stopped: {path}")
         if path.is_dir():
             for entry in snapshot:
@@ -1248,25 +1471,31 @@ def repair(home, apply):
     if read_state(sidebar) != state:
         raise ValueError("Sidebar state changed while it was being read. Quit Codex and run repair again.")
     stamp = datetime.now().strftime("%Y%m%d-%H%M%S-%f")
-    backup = home / f"sidebar-repair-backup-{stamp}.json"
-    temp = sidebar.with_name(f".codex-global-state.json.repair-tmp-{stamp}")
+    ensure_backup_directory()
+    backup = BACKUP_DIR / f"sidebar-repair-backup-{stamp}.json"
     payload = json.dumps(updated, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
-    try:
-        backup.write_bytes(original)
-        temp.write_bytes(payload)
-        require_stopped()
-        if sidebar.read_bytes() != original:
-            raise ValueError("Sidebar state changed. Repair stopped before writing.")
-        os.replace(temp, sidebar)
-    finally:
-        if temp.exists():
-            temp.unlink()
-    print(f"Sidebar repaired. Backup: {backup.name}. Open Codex and check Projects and Sections.")
+    with backup.open("xb") as stream:
+        stream.write(original)
+    require_stopped()
+    if sidebar.read_bytes() != original:
+        raise ValueError("Sidebar state changed. Repair stopped before writing.")
+    replace_file(sidebar, content=payload)
+    print(f"Sidebar repaired. Backup: {backup}. Open Codex and check Projects and Sections.")
 
 
 def launch_gui():
     import tkinter as tk
     from tkinter import filedialog, messagebox, ttk
+
+    if os.name == "nt":
+        from ctypes import wintypes, windll, byref
+        user32 = windll.user32
+        user32.SetProcessDPIAware()
+        work_area = wintypes.RECT()
+        if not user32.SystemParametersInfoW(0x0030, 0, byref(work_area), 0):
+            work_area = None
+    else:
+        work_area = None
 
     class TransferWindow:
         def __init__(self, root):
@@ -1275,100 +1504,127 @@ def launch_gui():
             self.preview_ready = None
             self.events = queue.Queue()
             self.root.title("Codex 备份与恢复")
-            self.root.geometry("840x720")
-            self.root.minsize(680, 640)
-            self.root.configure(background="#f5f7fa")
+            surface = "#f5f7fa"
+            border = "#c9d3df"
+            self.root.configure(background=surface)
             self.root.protocol("WM_DELETE_WINDOW", self.close)
             self.mode = tk.StringVar(value="export")
             self.home = tk.StringVar(value=os.environ.get("CODEX_HOME", str(Path.home() / ".codex")))
-            self.archive = tk.StringVar(value=str(Path(__file__).resolve().with_name("codex-chats.zip")))
+            self.archive = tk.StringVar(value=str(DEFAULT_ARCHIVE))
             self.skills = tk.BooleanVar(value=True)
+            self.keep_existing = tk.BooleanVar(value=False)
             self.status = tk.StringVar(value="就绪")
             style = ttk.Style(root)
             style.theme_use("clam")
             style.configure(".", font=("Microsoft YaHei UI", 10))
-            style.configure("TFrame", background="#f5f7fa")
-            style.configure("TLabel", background="#f5f7fa", foreground="#172b45")
-            style.configure("Title.TLabel", font=("Microsoft YaHei UI", 20, "bold"))
+            style.configure("TFrame", background=surface)
+            style.configure("TLabel", background=surface, foreground="#172b45")
+            style.configure("Title.TLabel", font=("Microsoft YaHei UI", 17, "bold"))
+            style.configure("Section.TLabel", font=("Microsoft YaHei UI", 10, "bold"))
             style.configure("Hint.TLabel", foreground="#465a70")
-            style.configure("TButton", padding=(14, 9))
-            style.configure("Primary.TButton", foreground="white", background="#245c9a")
+            style.configure("TButton", padding=(12, 5), width=0, background="#ffffff",
+                            bordercolor=border, lightcolor=border, darkcolor=border)
+            style.map("TButton", background=[("disabled", surface), ("active", "#e7eff8")])
+            style.configure("Primary.TButton", foreground="white", background="#245c9a",
+                            bordercolor="#245c9a", lightcolor="#245c9a", darkcolor="#245c9a")
             style.map("Primary.TButton", background=[("disabled", "#d7dfe9"), ("active", "#174679")],
                       foreground=[("disabled", "#536376")])
-            style.configure("TRadiobutton", background="#f5f7fa", padding=(0, 9))
-            style.configure("TCheckbutton", background="#f5f7fa")
+            style.configure("Mode.Toolbutton", padding=(10, 7), background="#e9eef4",
+                            foreground="#273c55", bordercolor=border, relief="flat", anchor="center")
+            style.map("Mode.Toolbutton", background=[("selected", "#d7e7fa"), ("active", "#e1eaf4")],
+                      foreground=[("disabled", "#536376"), ("selected", "#174679")],
+                      relief=[("focus", "solid"), ("!focus", "flat")])
+            style.configure("TEntry", padding=(8, 4), fieldbackground="white",
+                            bordercolor=border, lightcolor=border, darkcolor=border)
+            style.map("TEntry", bordercolor=[("focus", "#245c9a")])
+            style.configure("TCheckbutton", background=surface)
             self.controls = []
             self.root.columnconfigure(0, weight=1)
             self.root.rowconfigure(0, weight=1)
-            body = ttk.Frame(root, padding=28)
+            body = ttk.Frame(root, padding=(20, 16))
             body.grid(sticky="nsew")
             body.columnconfigure(0, weight=1)
-            body.rowconfigure(9, weight=1)
+            body.rowconfigure(8, weight=1)
             ttk.Label(body, text="Codex 备份与恢复", style="Title.TLabel").grid(sticky="w")
-            ttk.Label(body, text="备份聊天、分组和全局规则，迁移 Skills，修复侧栏", style="Hint.TLabel").grid(
-                sticky="w", pady=(6, 18))
             modes = ttk.Frame(body)
-            modes.grid(row=2, sticky="ew", pady=(0, 14))
-            for mode, label in (("export", "导出会话"), ("import", "导入会话"),
-                                ("cleanup", "清理旧文件"), ("repair", "修复侧栏")):
-                button = ttk.Radiobutton(modes, text=label, value=mode, variable=self.mode)
-                button.pack(side="left", padx=(0, 28))
+            modes.grid(row=1, sticky="ew", pady=(12, 14))
+            choices = (("export", "导出会话"), ("import", "导入会话"),
+                       ("cleanup", "清理旧文件"), ("repair", "修复侧栏"))
+            for column, (mode, label) in enumerate(choices):
+                modes.columnconfigure(column, weight=1, uniform="modes")
+                button = ttk.Radiobutton(modes, text=label, value=mode, variable=self.mode,
+                                         style="Mode.Toolbutton")
+                button.grid(row=0, column=column, sticky="ew", padx=(4 if column else 0, 0))
                 self.controls.append(button)
-            self.path_field(body, 3, "Codex 数据目录", self.home, self.choose_home)
-            self.archive_entry, self.archive_button = self.path_field(
-                body, 4, "会话 ZIP", self.archive, self.choose_archive)
-            options = ttk.Frame(body)
-            options.grid(row=5, sticky="ew", pady=(4, 12))
-            self.skills_button = ttk.Checkbutton(options, text="同时迁移用户 Skills", variable=self.skills)
-            self.skills_button.pack(side="left")
-            self.controls.append(self.skills_button)
-            self.hint = ttk.Label(body, style="Hint.TLabel", wraplength=740)
-            self.hint.grid(row=6, sticky="ew", pady=(0, 14))
-            actions = ttk.Frame(body)
-            actions.grid(row=7, sticky="ew", pady=(0, 18))
-            self.preview_button = ttk.Button(actions, text="预览", command=lambda: self.start(True))
-            self.preview_button.pack(side="left")
-            self.run_button = ttk.Button(actions, text="开始导出", style="Primary.TButton",
-                                         command=lambda: self.start(False))
-            self.run_button.pack(side="left", padx=12)
-            self.controls.extend((self.preview_button, self.run_button))
-            ttk.Label(body, text="运行记录").grid(row=8, sticky="w", pady=(0, 8))
+            paths = ttk.Frame(body)
+            paths.grid(row=2, sticky="ew")
+            paths.columnconfigure(1, weight=1)
+            self.path_field(paths, 0, "Codex 数据目录", self.home, self.choose_home)
+            self.archive_row = self.path_field(paths, 1, "会话 ZIP", self.archive, self.choose_archive)
+            self.options = ttk.Frame(body)
+            self.options.grid(row=3, sticky="ew", pady=(8, 0))
+            skills = ttk.Checkbutton(self.options, text="同时迁移用户 Skills", variable=self.skills)
+            skills.grid(row=0, column=0, sticky="w")
+            self.controls.append(skills)
+            self.keep_button = ttk.Checkbutton(self.options, text="历史分叉时保留本机版本",
+                                               variable=self.keep_existing)
+            self.keep_button.grid(row=1, column=0, sticky="w", pady=(4, 0))
+            self.controls.append(self.keep_button)
+            self.hint = ttk.Label(body, style="Hint.TLabel", justify="left", wraplength=520)
+            self.hint.grid(row=4, sticky="ew", pady=(8, 12))
+            ttk.Separator(body).grid(row=5, sticky="ew")
+            ttk.Label(body, text="运行记录", style="Section.TLabel").grid(
+                row=7, sticky="w", pady=(12, 6))
             log_frame = ttk.Frame(body)
-            log_frame.grid(row=9, sticky="nsew")
+            log_frame.grid(row=8, sticky="nsew")
             log_frame.columnconfigure(0, weight=1)
             log_frame.rowconfigure(0, weight=1)
             self.log = tk.Text(log_frame, wrap="word", state="disabled", background="white",
                                foreground="#23374d", font=("Microsoft YaHei UI", 10),
-                               relief="solid", borderwidth=1, padx=12, pady=10)
-            self.log.grid(sticky="nsew")
+                               width=1, height=5, relief="flat", borderwidth=0,
+                               highlightthickness=1, highlightbackground=border,
+                               highlightcolor="#245c9a", padx=10, pady=8)
+            self.log.grid(row=0, column=0, sticky="nsew")
             scrollbar = ttk.Scrollbar(log_frame, command=self.log.yview)
             scrollbar.grid(row=0, column=1, sticky="ns")
             self.log.configure(yscrollcommand=scrollbar.set)
             footer = ttk.Frame(body)
-            footer.grid(row=10, sticky="ew", pady=(14, 0))
+            footer.grid(row=9, sticky="ew", pady=(12, 0))
             footer.columnconfigure(0, weight=1)
-            ttk.Label(footer, textvariable=self.status).grid(sticky="w")
-            self.progress = ttk.Progressbar(footer, mode="indeterminate", length=140)
-            self.progress.grid(row=0, column=1, sticky="e")
-            for variable in (self.mode, self.home, self.archive, self.skills):
+            ttk.Label(footer, textvariable=self.status, style="Hint.TLabel").grid(row=0, column=0, sticky="w")
+            self.progress = ttk.Progressbar(footer, mode="indeterminate", length=52)
+            self.progress.grid(row=0, column=1, padx=(4, 12))
+            self.preview_button = ttk.Button(footer, text="预览", command=lambda: self.start(True))
+            self.preview_button.grid(row=0, column=2, padx=(0, 8))
+            self.run_button = ttk.Button(footer, text="开始导出", style="Primary.TButton",
+                                         command=lambda: self.start(False))
+            self.run_button.grid(row=0, column=3)
+            self.controls.extend((self.preview_button, self.run_button))
+            self.mode.trace_add("write", self.mode_changed)
+            for variable in (self.home, self.archive, self.skills):
                 variable.trace_add("write", self.selection_changed)
-            root.bind("<Configure>", lambda event: self.hint.configure(
-                wraplength=max(400, body.winfo_width() - 56)) if event.widget == root else None)
+            body.bind("<Configure>", lambda event: self.hint.configure(wraplength=max(1, event.width - 40)))
             self.selection_changed()
-            self.write_log("选择操作，核对路径后先预览。正式迁移或清理前，请完全退出 Codex。\n")
+            scale = float(root.tk.call("tk", "scaling")) / (96 / 72)
+            left, top, right, bottom = ((work_area.left, work_area.top, work_area.right, work_area.bottom)
+                                        if work_area else (0, 0, root.winfo_screenwidth(), root.winfo_screenheight()))
+            width = min(round(760 * scale), right - left - 32)
+            height = min(round(560 * scale), bottom - top - 64)
+            root.minsize(min(round(600 * scale), width), min(round(470 * scale), height))
+            root.geometry(f"{width}x{height}+{left + (right - left - width) // 2}"
+                          f"+{top + (bottom - top - height) // 2}")
+            self.write_log("需要退出 Codex 时，窗口会先询问是否自动结束相关进程。\n")
             self.root.after(100, self.poll)
 
-        def path_field(self, body, row, label, variable, command):
-            frame = ttk.Frame(body)
-            frame.grid(row=row, sticky="ew", pady=(0, 14))
-            frame.columnconfigure(0, weight=1)
-            ttk.Label(frame, text=label).grid(row=0, column=0, sticky="w", pady=(0, 6))
-            entry = ttk.Entry(frame, textvariable=variable)
-            entry.grid(row=1, column=0, sticky="ew")
-            button = ttk.Button(frame, text="选择…", command=command)
-            button.grid(row=1, column=1, padx=(10, 0))
+        def path_field(self, frame, row, label, variable, command):
+            caption = ttk.Label(frame, text=label)
+            caption.grid(row=row, column=0, sticky="w", padx=(0, 12), pady=4)
+            entry = ttk.Entry(frame, textvariable=variable, width=1)
+            entry.grid(row=row, column=1, sticky="nsew", pady=4)
+            button = ttk.Button(frame, text="浏览…", command=command)
+            button.grid(row=row, column=2, sticky="ns", padx=(8, 0), pady=4)
             self.controls.extend((entry, button))
-            return entry, button
+            return caption, entry, button
 
         def choose_home(self):
             value = filedialog.askdirectory(parent=self.root, title="选择 Codex 数据目录",
@@ -1377,8 +1633,9 @@ def launch_gui():
                 self.home.set(value)
 
         def choose_archive(self):
+            directory = Path(self.archive.get()).parent
             options = dict(parent=self.root, filetypes=[("ZIP 文件", "*.zip")],
-                           initialdir=str(Path(self.archive.get()).parent))
+                           initialdir=str(directory if directory.is_dir() else SCRIPT_DIR))
             if self.mode.get() == "export":
                 value = filedialog.asksaveasfilename(
                     title="导出到 ZIP", defaultextension=".zip", confirmoverwrite=False,
@@ -1387,6 +1644,13 @@ def launch_gui():
                 value = filedialog.askopenfilename(title="选择会话 ZIP", **options)
             if value:
                 self.archive.set(value)
+
+        def mode_changed(self, *_):
+            if self.archive.get() in {str(DEFAULT_ARCHIVE), str(LEGACY_ARCHIVE)}:
+                default = str(default_archive(self.mode.get()))
+                if self.archive.get() != default:
+                    self.archive.set(default)
+            self.selection_changed()
 
         def selection_changed(self, *_):
             self.preview_ready = None
@@ -1398,8 +1662,21 @@ def launch_gui():
             mode = self.mode.get()
             local_mode = mode in ("cleanup", "repair")
             if local_mode:
-                for widget in (self.archive_entry, self.archive_button, self.skills_button):
-                    widget.configure(state="disabled")
+                for widget in self.archive_row:
+                    widget.grid_remove()
+                self.options.grid_remove()
+            else:
+                for widget in self.archive_row:
+                    widget.grid()
+                self.options.grid()
+            if mode == "import":
+                self.keep_button.grid()
+            else:
+                self.keep_button.grid_remove()
+            if self.running:
+                self.progress.grid()
+            else:
+                self.progress.grid_remove()
             labels = {"export": "开始导出", "import": "开始导入",
                       "cleanup": "清理预览中的文件", "repair": "修复预览中的侧栏"}
             self.run_button.configure(text=labels[mode])
@@ -1407,7 +1684,7 @@ def launch_gui():
                 self.run_button.configure(state="disabled")
             hints = {
                 "export": "备份项目会话、Section、完整分页历史和全局 AGENTS 规则。导出路径应选择一个新 ZIP。",
-                "import": "从 ZIP 恢复聊天、分组和全局规则。全局规则冲突时保留本机版本，缺失的项目目录会按原路径创建。",
+                "import": "单边续聊时保留较长历史。两边历史分叉时，默认备份本机记录后用 ZIP 覆盖。",
                 "cleanup": "只清理超过 7 天的导入备份和全局状态写入临时文件，保留最新一份导入备份。请先预览。",
                 "repair": "从数据库和旧的侧栏备份恢复被清空的项目、置顶和 Section 成员。不猜测新项目的分组。请先预览。",
             }
@@ -1448,12 +1725,13 @@ def launch_gui():
                 command.insert(4, self.archive.get())
                 if not self.skills.get():
                     command.append("--exclude-skills")
+                if mode == "import" and self.keep_existing.get():
+                    command.append("--keep-existing")
                 if preview:
                     command.append("--preview")
             elif apply:
                 command.append("--apply")
             self.running = True
-            self.preview_ready = None
             self.status.set("正在预览…" if preview else "正在处理…")
             self.write_log("\n" + ("预览" if preview else "执行") +
                            {"export": "导出", "import": "导入", "cleanup": "清理", "repair": "修复"}[mode] + "\n")
@@ -1461,8 +1739,16 @@ def launch_gui():
             self.progress.start(12)
             threading.Thread(target=self.worker, args=(command, mode, preview, home), daemon=True).start()
 
-        def worker(self, command, mode, preview, home):
+        def worker(self, command, mode, preview, home, approved=None):
             try:
+                if approved is not None:
+                    close_codex_processes(approved)
+                    self.events.put(("log", "相关进程已退出，继续操作。\n"))
+                elif mode in ("import", "repair") or not preview:
+                    active = active_codex_processes()
+                    if active:
+                        self.events.put(("confirm_close", (command, mode, preview, home, active)))
+                        return
                 environment = os.environ.copy()
                 environment["PYTHONIOENCODING"] = "utf-8"
                 with subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
@@ -1482,10 +1768,28 @@ def launch_gui():
                     kind, value = self.events.get_nowait()
                     if kind == "log":
                         self.write_log(value)
+                    elif kind == "confirm_close":
+                        active = value[-1]
+                        names = "、".join(sorted(set(active.values())))
+                        if messagebox.askyesno(
+                            "退出 Codex 后继续",
+                            f"检测到正在运行的进程：{names}\n\n"
+                            "是否强制结束这些进程并继续？运行中的任务可能中断。"
+                            "请先保存尚未完成的工作。",
+                            default=messagebox.NO, parent=self.root,
+                        ):
+                            self.status.set("正在退出 Codex…")
+                            threading.Thread(target=self.worker, args=value, daemon=True).start()
+                        else:
+                            self.running = False
+                            self.progress.stop()
+                            self.status.set("已取消")
+                            self.refresh_controls()
                     else:
                         code, mode, preview, home = value
                         self.running = False
                         self.progress.stop()
+                        self.preview_ready = None
                         if code == 0:
                             self.status.set("预览完成" if preview else "操作完成")
                             if mode in ("cleanup", "repair") and preview:
@@ -1512,8 +1816,7 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("mode", choices=("export", "import", "cleanup", "repair", "gui"))
     parser.add_argument("archive", nargs="?", type=Path,
-                        default=Path(__file__).resolve().with_name("codex-chats.zip"),
-                        help="ZIP path (default: codex-chats.zip beside this script)")
+                        help="ZIP path (default: backups/codex-chats.zip beside this script)")
     parser.add_argument("--codex-home", type=Path, default=Path(os.environ.get(
         "CODEX_HOME", str(Path.home() / ".codex"))))
     parser.add_argument("--preview", action="store_true")
@@ -1526,10 +1829,14 @@ def main():
                                help="Skip user skills during export or import")
     parser.set_defaults(include_skills=True)
     parser.add_argument("--provider", help="Optional target model_provider for imported thread rows")
+    parser.add_argument("--keep-existing", action="store_true",
+                        help="Keep destination history when conversations have diverged (import only)")
     if len(sys.argv) == 1:
         launch_gui()
         return
     args = parser.parse_args()
+    if args.keep_existing and args.mode != "import":
+        parser.error("--keep-existing is only valid with import")
     if args.apply and args.mode not in ("cleanup", "repair"):
         parser.error("--apply is only valid with cleanup or repair")
     if args.apply and args.preview:
@@ -1537,11 +1844,15 @@ def main():
     if args.mode == "gui":
         launch_gui()
         return
-    home, archive = args.codex_home.resolve(), args.archive.resolve()
+    home = args.codex_home.resolve()
+    archive = args.archive or default_archive(args.mode)
+    if args.mode == "export" and archive.absolute() == DEFAULT_ARCHIVE and is_link(BACKUP_DIR):
+        raise ValueError(f"Backup directory is a link: {BACKUP_DIR}")
+    archive = archive.resolve()
     if args.mode == "export":
         export(home, archive, args.preview, args.include_skills)
     elif args.mode == "import":
-        import_bundle(home, archive, args.preview, args.provider, args.include_skills)
+        import_bundle(home, archive, args.preview, args.provider, args.include_skills, args.keep_existing)
     elif args.mode == "cleanup":
         cleanup(home, args.apply)
     else:
@@ -1551,5 +1862,6 @@ def main():
 if __name__ == "__main__":
     try:
         main()
-    except (ValueError, OSError, sqlite3.Error, zipfile.BadZipFile, subprocess.SubprocessError) as exc:
+    except (ValueError, OSError, EOFError, zstd.ZstdError, sqlite3.Error,
+            zipfile.BadZipFile, subprocess.SubprocessError) as exc:
         sys.exit(f"Stopped: {exc}")
