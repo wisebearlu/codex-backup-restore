@@ -104,6 +104,13 @@ python codex-backup-restore.py cleanup --apply
 
 会话、正式数据库、Skills、配置、浏览器数据、导出的 ZIP 和其他工具的备份会保留。`cleanup` 默认只打印路径和可释放大小，`--apply` 才会永久删除列出的项。
 
+「清理旧文件」默认勾选 Codex 应用和插件缓存。预览和结果先显示总量，点「查看明细」可展开文件清单和缓存小计。脚本只匹配超过 7 天的应用目录、连接器工具与服务信息、远程插件目录 JSON 缓存。Codex 下次使用这些功能时可能重新下载目录数据。命令行通过 `--include-cache` 纳入缓存：
+
+```text
+python codex-backup-restore.py cleanup --include-cache
+python codex-backup-restore.py cleanup --include-cache --apply
+```
+
 ### 修复被清空的侧栏
 
 Codex 异常退出后，侧栏里的项目、置顶和 Section 成员可能变成空列表，而 `state_5.sqlite` 里的项目和会话归属还在。`repair` 根据数据库和本机旧的全局状态文件，把这些侧栏登记填回去。
@@ -218,6 +225,13 @@ python codex-backup-restore.py cleanup --apply
 Cleanup checks the script's `backups` directory and the Codex data directory for import backups older than seven days. It also checks for old Codex global-state temporary files. It keeps the newest import backup in each location and backups of replaced conversation files. Recently modified directories or files, backups with unexpected contents, and links are skipped. Deleting an old backup removes its corresponding rollback option.
 
 Conversations, active databases, Skills, configuration, browser data, exported ZIPs, and other tools' backups are retained. The default command lists candidates and their size. `--apply` permanently deletes the listed candidates.
+
+The cleanup tab includes Codex app and plugin caches by default. Preview and results show totals first. Select 查看明细 (Show details) for the file list and cache subtotal. The script matches app directory, connector tool and server metadata, and remote plugin catalog JSON cache files older than seven days. Codex may download this data again the next time it uses those features. Use `--include-cache` to include caches from the command line:
+
+```text
+python codex-backup-restore.py cleanup --include-cache
+python codex-backup-restore.py cleanup --include-cache --apply
+```
 
 ### Repair a wiped sidebar
 

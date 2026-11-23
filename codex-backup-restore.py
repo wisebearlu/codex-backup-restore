@@ -46,6 +46,12 @@ BACKUP_NAME = re.compile(r"conversation-transfer-backup-\d{8}-\d{6}-\d{6}$")
 STATE_TEMP_NAME = re.compile(
     rf"\.\.codex-global-state\.json(?:\.bak)?\.tmp-\d+-{UUID}$", re.I)
 BACKUP_FILES = {STATE, HISTORY, INDEX, SIDEBAR, "new-index.tmp", "new-sidebar.tmp"}
+CACHE_FILE_PATTERNS = {
+    "codex_app_directory": re.compile(r"[0-9a-f]{40}\.json"),
+    "codex_apps_server_info": re.compile(r"[0-9a-f]{40}\.json"),
+    "codex_apps_tools": re.compile(r"[0-9a-f]{40}\.json"),
+    "remote_plugin_catalog": re.compile(r"[0-9a-f]{16}\.json"),
+}
 SECTION_ATOM = "sidebar-custom-sections-v3"
 LEGACY_MAP = "app-server-project-id-by-legacy-project-id-by-host"
 MIGRATION_PREFIX = "electron-owner-value:app-server-projects-migration-by-host:"
@@ -976,12 +982,33 @@ def cleanup_snapshot(path):
     return snapshot
 
 
-def cleanup(home, apply=False):
+def format_cleanup_size(size):
+    if size >= 1_000_000_000:
+        return f"{size / 1_000_000_000:.2f} GB"
+    if 0 < size < 10_000:
+        return "<0.01 MB"
+    return f"{size / 1_000_000:.2f} MB"
+
+
+def codex_cache_files(home):
+    cache = home / "cache"
+    if is_link(cache) or not cache.is_dir():
+        return set()
+    files = set()
+    for name, pattern in CACHE_FILE_PATTERNS.items():
+        directory = cache / name
+        if not is_link(directory) and directory.is_dir():
+            files.update(path for path in directory.iterdir() if pattern.fullmatch(path.name))
+    return files
+
+
+def cleanup(home, apply=False, include_cache=False):
     if not home.is_dir():
         raise ValueError(f"Missing Codex directory: {home}")
     cutoff = time.time_ns() - CLEANUP_DAYS * 24 * 60 * 60 * 1_000_000_000
     roots = {home, BACKUP_DIR}
     children = set(home.iterdir())
+    cache_files = codex_cache_files(home) if include_cache else set()
     protected = set()
     if BACKUP_DIR.is_dir() and not is_link(BACKUP_DIR):
         children.update(path for path in BACKUP_DIR.iterdir() if BACKUP_NAME.fullmatch(path.name))
@@ -991,12 +1018,15 @@ def cleanup(home, apply=False):
         if backups:
             protected.add(max(backups))
     candidates = []
+    total_files = 0
+    total_backups = 0
     total_bytes = 0
-    for path in sorted(children):
+    for path in sorted(children | cache_files):
         if path in protected:
             continue
         is_backup = bool(BACKUP_NAME.fullmatch(path.name))
-        if not is_backup and not STATE_TEMP_NAME.fullmatch(path.name):
+        is_cache = path in cache_files
+        if not is_backup and not is_cache and not STATE_TEMP_NAME.fullmatch(path.name):
             continue
         try:
             if is_backup and not path.is_dir():
@@ -1009,29 +1039,62 @@ def cleanup(home, apply=False):
         except (ValueError, OSError) as error:
             print(error)
             continue
-        size = sum(info[1] for entry, info in snapshot.items() if entry.is_file())
+        files = [info for info in snapshot.values() if stat.S_ISREG(info[3])]
+        size = sum(info[1] for info in files)
+        total_files += len(files)
+        total_backups += int(is_backup)
         total_bytes += size
-        candidates.append((path, snapshot))
-        print(f"Cleanup candidate: {path} ({size:,} bytes)")
-    print(f"{len(candidates)} cleanup candidates, {total_bytes:,} bytes.")
+        candidates.append((path, snapshot, size))
     for path in sorted(protected):
         print(f"Keeping newest import backup: {path}")
     if not apply:
+        for path, snapshot, size in candidates:
+            if path in cache_files:
+                kind = "Codex cache"
+            else:
+                kind = "Backup directory" if stat.S_ISDIR(snapshot[path][3]) else "Temporary file"
+            print(f"{kind}: {path} ({format_cleanup_size(size)})")
+        if include_cache:
+            sizes = [size for path, _, size in candidates if path in cache_files]
+            print(f"Codex cache candidates: {len(sizes):,} files, {format_cleanup_size(sum(sizes))}.")
         print("Preview only. Use cleanup --apply to delete these old files.")
+        print(f"\nCleanup preview: {total_files:,} files, {total_backups:,} backup directories, "
+              f"{format_cleanup_size(total_bytes)}.")
         return
     require_stopped()
-    for path, snapshot in candidates:
-        if path.parent not in roots or is_link(path.parent) or path.resolve().parent != path.parent.resolve() \
-                or cleanup_snapshot(path) != snapshot:
-            raise ValueError(f"Cleanup candidate changed; stopped: {path}")
-        if path.is_dir():
-            for entry in snapshot:
-                if entry != path:
+    deleted_files = deleted_backups = deleted_bytes = 0
+    deleted_cache_files = deleted_cache_bytes = 0
+    try:
+        for path, snapshot, _ in candidates:
+            if path in cache_files:
+                cache = home / "cache"
+                allowed = (not is_link(cache) and not is_link(path.parent)
+                           and path.resolve().parent == path.parent
+                           and path.is_file())
+            else:
+                allowed = (path.parent in roots and not is_link(path.parent)
+                           and path.resolve().parent == path.parent.resolve())
+            if not allowed or cleanup_snapshot(path) != snapshot:
+                raise ValueError(f"Cleanup candidate changed; stopped: {path}")
+            for entry, info in snapshot.items():
+                if stat.S_ISREG(info[3]):
                     entry.unlink()
-            path.rmdir()
-        else:
-            path.unlink()
-        print(f"Deleted: {path.name}")
+                    deleted_files += 1
+                    deleted_bytes += info[1]
+                    if path in cache_files:
+                        deleted_cache_files += 1
+                        deleted_cache_bytes += info[1]
+                    print(f"Deleted file: {entry} ({format_cleanup_size(info[1])})")
+            if stat.S_ISDIR(snapshot[path][3]):
+                path.rmdir()
+                deleted_backups += 1
+                print(f"Deleted backup directory: {path}")
+    finally:
+        if include_cache:
+            print(f"Codex caches deleted: {deleted_cache_files:,} files, "
+                  f"{format_cleanup_size(deleted_cache_bytes)}.")
+        print(f"\nCleanup result: {deleted_files:,} files, {deleted_backups:,} backup directories, "
+              f"{format_cleanup_size(deleted_bytes)} deleted.")
 
 
 def read_state(path):
@@ -1487,10 +1550,14 @@ def launch_gui():
     import tkinter as tk
     from tkinter import filedialog, messagebox, ttk
 
+    cleanup_details = ("Keeping newest import backup:", "Backup directory:", "Temporary file:",
+                       "Codex cache:", "Codex cache candidates:", "Codex caches deleted:",
+                       "Deleted file:", "Deleted backup directory:", "Preview only.")
     if os.name == "nt":
         from ctypes import wintypes, windll, byref
         user32 = windll.user32
         user32.SetProcessDPIAware()
+        windll.shell32.SetCurrentProcessExplicitAppUserModelID("CodexBackupRestore.Desktop")
         work_area = wintypes.RECT()
         if not user32.SystemParametersInfoW(0x0030, 0, byref(work_area), 0):
             work_area = None
@@ -1504,50 +1571,74 @@ def launch_gui():
             self.preview_ready = None
             self.events = queue.Queue()
             self.root.title("Codex 备份与恢复")
-            surface = "#f5f7fa"
-            border = "#c9d3df"
+            surface = "#edf2f8"
+            paper = "#ffffff"
+            ink = "#182b44"
+            muted = "#455a74"
+            border = "#bdcbdb"
+            accent = "#2456a6"
+            banner_color = "#162e50"
+            assets = SCRIPT_DIR / "assets"
+            icon = assets / "app-icon.ico"
+            if os.name == "nt" and icon.is_file():
+                self.root.iconbitmap(default=str(icon))
             self.root.configure(background=surface)
             self.root.protocol("WM_DELETE_WINDOW", self.close)
             self.mode = tk.StringVar(value="export")
             self.home = tk.StringVar(value=os.environ.get("CODEX_HOME", str(Path.home() / ".codex")))
             self.archive = tk.StringVar(value=str(DEFAULT_ARCHIVE))
             self.skills = tk.BooleanVar(value=True)
+            self.include_cache = tk.BooleanVar(value=True)
             self.keep_existing = tk.BooleanVar(value=False)
             self.status = tk.StringVar(value="就绪")
             style = ttk.Style(root)
             style.theme_use("clam")
             style.configure(".", font=("Microsoft YaHei UI", 10))
             style.configure("TFrame", background=surface)
-            style.configure("TLabel", background=surface, foreground="#172b45")
-            style.configure("Title.TLabel", font=("Microsoft YaHei UI", 17, "bold"))
+            style.configure("TLabel", background=surface, foreground=ink)
+            style.configure("Banner.TFrame", background=banner_color)
+            style.configure("Title.TLabel", background=banner_color, foreground=paper,
+                            font=("Microsoft YaHei UI", 17, "bold"))
             style.configure("Section.TLabel", font=("Microsoft YaHei UI", 10, "bold"))
-            style.configure("Hint.TLabel", foreground="#465a70")
-            style.configure("TButton", padding=(12, 5), width=0, background="#ffffff",
+            style.configure("Hint.TLabel", foreground=muted)
+            style.configure("Done.TLabel", foreground="#17624f")
+            style.configure("Error.TLabel", foreground="#a12e37")
+            style.configure("TButton", padding=(12, 6), width=0, background=paper, foreground=ink,
                             bordercolor=border, lightcolor=border, darkcolor=border)
-            style.map("TButton", background=[("disabled", surface), ("active", "#e7eff8")])
-            style.configure("Primary.TButton", foreground="white", background="#245c9a",
-                            bordercolor="#245c9a", lightcolor="#245c9a", darkcolor="#245c9a")
-            style.map("Primary.TButton", background=[("disabled", "#d7dfe9"), ("active", "#174679")],
+            style.map("TButton", background=[("disabled", surface), ("active", "#e0ebfb")],
+                      bordercolor=[("focus", accent)])
+            style.configure("Primary.TButton", foreground=paper, background=accent,
+                            bordercolor=accent, lightcolor=accent, darkcolor=accent)
+            style.map("Primary.TButton", background=[("disabled", "#d8e2ef"), ("active", "#1a447f")],
                       foreground=[("disabled", "#536376")])
-            style.configure("Mode.Toolbutton", padding=(10, 7), background="#e9eef4",
-                            foreground="#273c55", bordercolor=border, relief="flat", anchor="center")
-            style.map("Mode.Toolbutton", background=[("selected", "#d7e7fa"), ("active", "#e1eaf4")],
-                      foreground=[("disabled", "#536376"), ("selected", "#174679")],
+            style.configure("Mode.Toolbutton", padding=(10, 8), background="#e1e9f3",
+                            foreground=ink, bordercolor=border, relief="flat", anchor="center")
+            style.map("Mode.Toolbutton", background=[("disabled", "#e1e9f3"),
+                                                     ("selected", accent), ("active", "#d2e1f5")],
+                      foreground=[("disabled", "#536376"), ("selected", paper)],
                       relief=[("focus", "solid"), ("!focus", "flat")])
-            style.configure("TEntry", padding=(8, 4), fieldbackground="white",
+            style.configure("TEntry", padding=(8, 5), fieldbackground=paper, foreground=ink,
                             bordercolor=border, lightcolor=border, darkcolor=border)
-            style.map("TEntry", bordercolor=[("focus", "#245c9a")])
+            style.map("TEntry", bordercolor=[("focus", accent)])
             style.configure("TCheckbutton", background=surface)
+            style.configure("Horizontal.TProgressbar", background=accent, troughcolor="#d9e4f1",
+                            lightcolor=accent, darkcolor=accent, bordercolor="#d9e4f1")
             self.controls = []
             self.root.columnconfigure(0, weight=1)
-            self.root.rowconfigure(0, weight=1)
-            body = ttk.Frame(root, padding=(20, 16))
-            body.grid(sticky="nsew")
+            self.root.rowconfigure(1, weight=1)
+            banner = ttk.Frame(root, style="Banner.TFrame", padding=(22, 14))
+            banner.grid(row=0, column=0, sticky="ew")
+            emblem = assets / "app-icon.png"
+            self.emblem = tk.PhotoImage(file=str(emblem)) if emblem.is_file() else None
+            if self.emblem:
+                ttk.Label(banner, image=self.emblem, style="Title.TLabel").pack(side="left", padx=(0, 12))
+            ttk.Label(banner, text="Codex 备份与恢复", style="Title.TLabel").pack(side="left")
+            body = ttk.Frame(root, padding=(22, 16))
+            body.grid(row=1, column=0, sticky="nsew")
             body.columnconfigure(0, weight=1)
             body.rowconfigure(8, weight=1)
-            ttk.Label(body, text="Codex 备份与恢复", style="Title.TLabel").grid(sticky="w")
             modes = ttk.Frame(body)
-            modes.grid(row=1, sticky="ew", pady=(12, 14))
+            modes.grid(row=1, sticky="ew", pady=(0, 14))
             choices = (("export", "导出会话"), ("import", "导入会话"),
                        ("cleanup", "清理旧文件"), ("repair", "修复侧栏"))
             for column, (mode, label) in enumerate(choices):
@@ -1570,28 +1661,41 @@ def launch_gui():
                                                variable=self.keep_existing)
             self.keep_button.grid(row=1, column=0, sticky="w", pady=(4, 0))
             self.controls.append(self.keep_button)
+            self.cache_button = ttk.Checkbutton(body, text="同时清理 Codex 应用和插件缓存",
+                                                variable=self.include_cache)
+            self.cache_button.grid(row=3, sticky="w", pady=(8, 0))
+            self.controls.append(self.cache_button)
             self.hint = ttk.Label(body, style="Hint.TLabel", justify="left", wraplength=520)
             self.hint.grid(row=4, sticky="ew", pady=(8, 12))
             ttk.Separator(body).grid(row=5, sticky="ew")
-            ttk.Label(body, text="运行记录", style="Section.TLabel").grid(
-                row=7, sticky="w", pady=(12, 6))
+            log_header = ttk.Frame(body)
+            log_header.grid(row=7, sticky="ew", pady=(12, 6))
+            ttk.Label(log_header, text="运行记录", style="Section.TLabel").pack(side="left")
+            self.details_button = ttk.Button(log_header, text="查看明细", command=self.toggle_details,
+                                             state="disabled")
+            self.details_button.pack(side="right")
             log_frame = ttk.Frame(body)
             log_frame.grid(row=8, sticky="nsew")
             log_frame.columnconfigure(0, weight=1)
             log_frame.rowconfigure(0, weight=1)
-            self.log = tk.Text(log_frame, wrap="word", state="disabled", background="white",
-                               foreground="#23374d", font=("Microsoft YaHei UI", 10),
+            self.log = tk.Text(log_frame, wrap="word", state="disabled", background=paper,
+                               foreground=ink, font=("Microsoft YaHei UI", 10),
                                width=1, height=5, relief="flat", borderwidth=0,
                                highlightthickness=1, highlightbackground=border,
-                               highlightcolor="#245c9a", padx=10, pady=8)
+                               highlightcolor=accent, selectbackground="#cfe1fe", selectforeground=ink,
+                               padx=12, pady=10, spacing1=2)
             self.log.grid(row=0, column=0, sticky="nsew")
+            self.log.tag_configure("details", elide=True)
+            self.log.tag_configure("summary", foreground="#153e76",
+                                   font=("Microsoft YaHei UI", 11, "bold"), spacing3=5)
             scrollbar = ttk.Scrollbar(log_frame, command=self.log.yview)
             scrollbar.grid(row=0, column=1, sticky="ns")
             self.log.configure(yscrollcommand=scrollbar.set)
             footer = ttk.Frame(body)
             footer.grid(row=9, sticky="ew", pady=(12, 0))
             footer.columnconfigure(0, weight=1)
-            ttk.Label(footer, textvariable=self.status, style="Hint.TLabel").grid(row=0, column=0, sticky="w")
+            self.status_label = ttk.Label(footer, textvariable=self.status, style="Hint.TLabel")
+            self.status_label.grid(row=0, column=0, sticky="w")
             self.progress = ttk.Progressbar(footer, mode="indeterminate", length=52)
             self.progress.grid(row=0, column=1, padx=(4, 12))
             self.preview_button = ttk.Button(footer, text="预览", command=lambda: self.start(True))
@@ -1601,9 +1705,9 @@ def launch_gui():
             self.run_button.grid(row=0, column=3)
             self.controls.extend((self.preview_button, self.run_button))
             self.mode.trace_add("write", self.mode_changed)
-            for variable in (self.home, self.archive, self.skills):
+            for variable in (self.home, self.archive, self.skills, self.include_cache):
                 variable.trace_add("write", self.selection_changed)
-            body.bind("<Configure>", lambda event: self.hint.configure(wraplength=max(1, event.width - 40)))
+            body.bind("<Configure>", lambda event: self.hint.configure(wraplength=max(1, event.width - 44)))
             self.selection_changed()
             scale = float(root.tk.call("tk", "scaling")) / (96 / 72)
             left, top, right, bottom = ((work_area.left, work_area.top, work_area.right, work_area.bottom)
@@ -1651,6 +1755,9 @@ def launch_gui():
                 if self.archive.get() != default:
                     self.archive.set(default)
             self.selection_changed()
+            self.clear_log()
+            self.status.set("就绪")
+            self.status_label.configure(style="Hint.TLabel")
 
         def selection_changed(self, *_):
             self.preview_ready = None
@@ -1661,6 +1768,13 @@ def launch_gui():
                 widget.configure(state="disabled" if self.running else "normal")
             mode = self.mode.get()
             local_mode = mode in ("cleanup", "repair")
+            if mode == "cleanup":
+                self.cache_button.grid()
+                if not self.details_button.winfo_manager():
+                    self.details_button.pack(side="right")
+            else:
+                self.cache_button.grid_remove()
+                self.details_button.pack_forget()
             if local_mode:
                 for widget in self.archive_row:
                     widget.grid_remove()
@@ -1692,9 +1806,27 @@ def launch_gui():
 
         def write_log(self, text):
             self.log.configure(state="normal")
-            self.log.insert("end", text)
+            detail = self.mode.get() == "cleanup" and text.startswith(cleanup_details)
+            summary = self.mode.get() == "cleanup" and text.startswith(("Cleanup preview:", "Cleanup result:"))
+            tags = ("details",) if detail else ("summary",) if summary else ()
+            self.log.insert("end", text, tags)
+            if detail:
+                self.details_button.configure(state="normal")
             self.log.see("end")
             self.log.configure(state="disabled")
+
+        def toggle_details(self):
+            expanded = self.root.tk.getboolean(self.log.tag_cget("details", "elide"))
+            self.log.tag_configure("details", elide=not expanded)
+            self.details_button.configure(text="收起明细" if expanded else "查看明细")
+            self.log.see("1.0" if expanded else "end")
+
+        def clear_log(self):
+            self.log.configure(state="normal")
+            self.log.delete("1.0", "end")
+            self.log.configure(state="disabled")
+            self.log.tag_configure("details", elide=True)
+            self.details_button.configure(text="查看明细", state="disabled")
 
         def start(self, preview):
             if self.running:
@@ -1731,9 +1863,13 @@ def launch_gui():
                     command.append("--preview")
             elif apply:
                 command.append("--apply")
+            if mode == "cleanup" and self.include_cache.get():
+                command.append("--include-cache")
             self.running = True
             self.status.set("正在预览…" if preview else "正在处理…")
-            self.write_log("\n" + ("预览" if preview else "执行") +
+            self.status_label.configure(style="Hint.TLabel")
+            self.clear_log()
+            self.write_log(("预览" if preview else "执行") +
                            {"export": "导出", "import": "导入", "cleanup": "清理", "repair": "修复"}[mode] + "\n")
             self.refresh_controls()
             self.progress.start(12)
@@ -1792,10 +1928,12 @@ def launch_gui():
                         self.preview_ready = None
                         if code == 0:
                             self.status.set("预览完成" if preview else "操作完成")
+                            self.status_label.configure(style="Done.TLabel")
                             if mode in ("cleanup", "repair") and preview:
                                 self.preview_ready = (mode, home)
                         else:
                             self.status.set("操作未完成，请查看运行记录")
+                            self.status_label.configure(style="Error.TLabel")
                         self.refresh_controls()
             except queue.Empty:
                 pass
@@ -1822,6 +1960,8 @@ def main():
     parser.add_argument("--preview", action="store_true")
     parser.add_argument("--apply", action="store_true",
                         help="Write cleanup deletions or the sidebar repair (default: preview only)")
+    parser.add_argument("--include-cache", action="store_true",
+                        help="Also clean old Codex app and plugin metadata caches (cleanup only)")
     skill_options = parser.add_mutually_exclusive_group()
     skill_options.add_argument("--include-skills", dest="include_skills", action="store_true",
                                help="Transfer user skills (default)")
@@ -1835,6 +1975,8 @@ def main():
         launch_gui()
         return
     args = parser.parse_args()
+    if args.include_cache and args.mode != "cleanup":
+        parser.error("--include-cache is only valid with cleanup")
     if args.keep_existing and args.mode != "import":
         parser.error("--keep-existing is only valid with import")
     if args.apply and args.mode not in ("cleanup", "repair"):
@@ -1854,7 +1996,7 @@ def main():
     elif args.mode == "import":
         import_bundle(home, archive, args.preview, args.provider, args.include_skills, args.keep_existing)
     elif args.mode == "cleanup":
-        cleanup(home, args.apply)
+        cleanup(home, args.apply, args.include_cache)
     else:
         repair(home, args.apply)
 
