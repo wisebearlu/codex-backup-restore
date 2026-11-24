@@ -76,7 +76,9 @@ python codex-backup-restore.py import --keep-existing
 
 导出默认包含 Codex 数据目录下的 `AGENTS.md` 和 `AGENTS.override.md`（存在时）。导入会将文件恢复到目标机的 Codex 数据目录；使用 `--codex-home` 时以指定目录为准。`--exclude-skills` 只跳过 Skills，全局规则仍会导出和导入。
 
-目标机缺少文件时自动恢复，内容相同时跳过，内容不同时提示 `Global instruction conflict, kept destination` 并保留目标机版本。预览会列出待恢复数量及冲突。旧 ZIP 仍可导入；要包含全局规则，请用新版重新导出。项目内的 `AGENTS.md` 随 Git 同步。
+导出会跟随全局规则中的 Markdown 文件引用，包括被引用文档里的后续引用。只收集 Codex 数据目录内的实际文件，并保留目录结构。支持相对路径和绝对路径。含空格的路径用反引号、引号或 Markdown 链接的尖括号括起来。导入时，随包恢复的文档中指向包内文档的绝对路径会自动改成目标机路径。显式引用的 Markdown 文件属于全局规则备份，即使用了 `--exclude-skills` 也会迁移。
+
+目标机缺少文件时自动恢复，内容相同时跳过，内容不同时提示 `Global instruction conflict, kept destination` 并保留目标机版本。预览会显示待恢复数量及冲突。旧 ZIP 仍可导入。要带上引用文件，请重新导出。项目内的 `AGENTS.md` 随 Git 同步。
 
 发布名称为 **Codex Backup & Restore**，主脚本已改名为 `codex-backup-restore.py`，命令参数沿用原用法。全局规则、会话和 Skills 可能包含私人信息，请私下保管备份包。
 
@@ -198,7 +200,9 @@ Repeat imports reuse Sections by ID and preserve destination names, assignments,
 
 Export includes `AGENTS.md` and `AGENTS.override.md` from the Codex data directory when present. Import restores them to the destination Codex data directory, including a custom `--codex-home`. The `--exclude-skills` option only skips Skills; global instructions still transfer.
 
-Missing destination files are restored. Identical files are skipped. When contents differ, the importer reports `Global instruction conflict, kept destination` and keeps the destination version. Preview reports additions and conflicts. Older ZIPs remain supported; export a fresh ZIP with this version to include global instructions. Repository-level `AGENTS.md` files travel through Git.
+Export follows Markdown file references in the global instructions and in the referenced documents. It collects regular files within the Codex data directory and preserves their folder structure. Relative and absolute paths are supported. Enclose paths containing spaces in backticks, quotes, or angle brackets within Markdown links. On import, absolute paths between restored documents are updated for the destination computer. Explicitly referenced Markdown files are part of the global instructions backup even with `--exclude-skills`.
+
+Missing destination files are restored. Identical files are skipped. When contents differ, the importer reports `Global instruction conflict, kept destination` and keeps the destination version. Preview reports additions and conflicts. Older ZIPs remain supported. Export a fresh ZIP to include referenced files. Repository-level `AGENTS.md` files travel through Git.
 
 The project is named **Codex Backup & Restore** and the main script is now `codex-backup-restore.py`. Existing command arguments still work. Global instructions, conversations, and Skills may contain private information; keep backup packages private.
 

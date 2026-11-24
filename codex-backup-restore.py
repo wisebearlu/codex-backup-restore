@@ -3,9 +3,11 @@ import argparse
 import copy
 import hashlib
 import json
+import ntpath
 import os
+import posixpath
 import queue
-from pathlib import Path, PurePosixPath
+from pathlib import Path, PurePosixPath, PureWindowsPath
 import re
 import shutil
 import sqlite3
@@ -35,6 +37,10 @@ SECTIONS = "thread_sections"
 SKILL_PREFIX = "user-skills"
 INSTRUCTION_PREFIX = "global-instructions"
 INSTRUCTION_FILES = ("AGENTS.md", "AGENTS.override.md")
+MARKDOWN_REFERENCE = re.compile(
+    r'''(?<=[`"'<])(?P<quoted>[^`"'<>\r\n]+?\.md)(?=[`"'>#])'''
+    r'''|(?<![\w./\\:%@~+-])(?P<plain>[^\s`"'<>()[\]{}#，。；：、]+?\.md)'''
+    r'''(?=$|[\s`"'<>()[\]{}#，。；：、,!]|\.(?!\w))''', re.I)
 STATE_TABLES = ("projects", "project_roots", "threads", "thread_dynamic_tools",
                 "thread_spawn_edges")
 HISTORY_TABLES = ("thread_turns", "thread_items", "thread_history_projection_state",
@@ -327,19 +333,88 @@ def collect_instructions(home):
         if path.exists():
             if not path.is_file():
                 raise ValueError(f"Global instruction path is not a file: {path}")
-            files[name] = path
+            files[Path(name)] = path
+    pending = deque(files)
+    while pending:
+        name = pending.popleft()
+        content = files[name].read_bytes().decode("utf-8", errors="surrogateescape")
+        for match in MARKDOWN_REFERENCE.finditer(content):
+            relative, _ = instruction_reference(match.group(0), str(home), name)
+            if relative is None or relative in files:
+                continue
+            path = home / relative
+            if not instruction_path_is_safe(home, relative) or not path.is_file():
+                continue
+            files[relative] = path
+            pending.append(relative)
     return files
+
+
+def instruction_reference(text, source_home, document):
+    path_type, normalize = PurePosixPath, posixpath.normpath
+    if re.match(r"^[A-Za-z]:[/\\]", source_home):
+        path_type, normalize = PureWindowsPath, ntpath.normpath
+        if re.match(r"^/[A-Za-z]:[/\\]", text):
+            text = text[1:]
+    if "://" in text or text.startswith(("//", "\\\\")):
+        return None, False
+    root = path_type(source_home)
+    reference = path_type(text)
+    absolute = reference.is_absolute()
+    if not root.is_absolute() or (not absolute and (reference.drive or reference.root)):
+        return None, False
+    candidate = reference if absolute else root.joinpath(*document.parent.parts, reference)
+    candidate = path_type(normalize(str(candidate)))
+    if not candidate.is_relative_to(root):
+        return None, absolute
+    parts = candidate.relative_to(root).parts
+    if not parts or any(":" in part or "\\" in part or os.path.isreserved(part) for part in parts):
+        return None, absolute
+    return Path(*parts), absolute
+
+
+def instruction_path_is_safe(home, relative):
+    target = home / relative
+    return target.resolve().is_relative_to(home) and not any(
+        is_link(path) for path in (target, *target.parents) if path.is_relative_to(home))
 
 
 def plan_instructions(home, work):
     additions = []
-    for name in INSTRUCTION_FILES:
-        source = work / INSTRUCTION_PREFIX / name
-        if not source.is_file():
-            continue
+    folder = work / INSTRUCTION_PREFIX
+    files = {path.relative_to(folder): path for path in folder.rglob("*") if path.is_file()}
+    manifest = json.loads((work / "manifest.json").read_text(encoding="utf-8"))
+    source_home = manifest.get("instruction_source_home")
+    if source_home is not None and not isinstance(source_home, str):
+        raise ValueError("Invalid global instruction source directory.")
+
+    for name, source in sorted(files.items()):
         target = home / name
-        if is_link(target) or (target.exists() and not target.is_file()):
+        if not instruction_path_is_safe(home, name) or (target.exists() and not target.is_file()):
             raise ValueError(f"Unsafe global instruction destination: {target}")
+        if any(parent.exists() and not parent.is_dir()
+               for parent in target.parents if parent.is_relative_to(home)):
+            raise ValueError(f"Global instruction parent is not a directory: {target}")
+        if source_home:
+            def rebase(match):
+                original = match.group(0)
+                relative, absolute = instruction_reference(original, source_home, name)
+                if not absolute or relative not in files:
+                    return original
+                destination = home / relative
+                updated_path = str(destination) if "\\" in original else destination.as_posix()
+                if match.group("plain") and any(char.isspace() for char in updated_path):
+                    return f"<{updated_path}>"
+                return updated_path
+
+            original = source.read_bytes().decode("utf-8", errors="surrogateescape")
+            updated = MARKDOWN_REFERENCE.sub(rebase, original)
+            if updated != original:
+                source.write_bytes(updated.encode("utf-8", errors="surrogateescape"))
+                if len(name.parts) >= 3 and name.parts[0].casefold() == "skills":
+                    skill_copy = work.joinpath(SKILL_PREFIX, "codex", *name.parts[1:])
+                    if skill_copy.is_file():
+                        shutil.copyfile(source, skill_copy)
         if target.is_file():
             if digest(source) != digest(target):
                 print(f"Global instruction conflict, kept destination: {target}")
@@ -404,7 +479,8 @@ def export(home, archive, preview, include_skills=True):
             package = work / "bundle.zip"
             with zipfile.ZipFile(package, "w", zipfile.ZIP_DEFLATED, compresslevel=3) as zip_file:
                 zip_file.writestr("manifest.json", json.dumps({"format": 1, "projects": len(projects),
-                                                              "chats": len(wanted & threads.keys())}))
+                                                              "chats": len(wanted & threads.keys()),
+                                                              "instruction_source_home": str(home)}))
                 zip_file.writestr(INDEX, "".join(json.dumps(row) + "\n" for row in index))
                 for name in (STATE, HISTORY):
                     zip_file.write(work / name, name)
@@ -414,7 +490,7 @@ def export(home, archive, preview, include_skills=True):
                     for relative, path in sorted(entries.items()):
                         zip_file.write(path, f"{SKILL_PREFIX}/{scope}/{folder}/{relative.as_posix()}")
                 for name, path in instructions.items():
-                    zip_file.write(path, f"{INSTRUCTION_PREFIX}/{name}")
+                    zip_file.write(path, f"{INSTRUCTION_PREFIX}/{name.as_posix()}")
             require_stopped()
             os.rename(package, archive)
         print(f"Saved {archive}")
@@ -434,8 +510,8 @@ def unpack(archive, work, include_skills):
             names.add(name.casefold())
             is_skill = (len(path.parts) >= 4 and path.parts[0] == SKILL_PREFIX
                         and path.parts[1] in {"codex", "agents"} and not path.parts[2].startswith("."))
-            is_instruction = (len(path.parts) == 2 and path.parts[0] == INSTRUCTION_PREFIX
-                              and path.parts[1] in INSTRUCTION_FILES)
+            is_instruction = (len(path.parts) >= 2 and path.parts[0] == INSTRUCTION_PREFIX
+                              and path.suffix.casefold() == ".md")
             if name not in required and not is_skill and not is_instruction and not (
                     len(path.parts) >= 2 and path.parts[0] in SESSION_DIRS and ROLLOUT.fullmatch(path.name)):
                 raise ValueError(f"Unexpected archive entry: {name}")
@@ -814,11 +890,13 @@ def import_bundle(home, archive, preview, provider, include_skills=True, keep_ex
     with tempfile.TemporaryDirectory(prefix="codex-transfer-", dir=archive.parent) as temp:
         work = Path(temp)
         unpack(archive, work, include_skills)
+        instructions = plan_instructions(home, work)
         skills = plan_skills(home, work) if include_skills else {}
         if include_skills:
             print(f"{len(skills)} new user skills.")
-        instructions = plan_instructions(home, work)
         print(f"{len(instructions)} new global instruction files.")
+        skill_targets = {target / relative for target, entries in skills.items() for relative in entries}
+        instructions = [(source, target) for source, target in instructions if target not in skill_targets]
         original_index = (home / INDEX).read_bytes() if (home / INDEX).is_file() else None
         original_sidebar = (home / SIDEBAR).read_bytes() if (home / SIDEBAR).is_file() else None
         # Work on database snapshots, leaving the live profile untouched during preview.
@@ -907,7 +985,10 @@ def import_bundle(home, archive, preview, provider, include_skills=True, keep_ex
                         with source.open("rb") as incoming:
                             shutil.copyfileobj(incoming, output)
             for source, target in additions:
-                target.parent.mkdir(parents=True, exist_ok=True)
+                for directory in reversed(target.parents):
+                    if not directory.is_dir():
+                        directory.mkdir()
+                        created_dirs.append(directory)
                 with target.open("xb") as output:
                     created.append(target)
                     with source.open("rb") as incoming:
